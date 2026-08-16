@@ -31,6 +31,7 @@ from footballai_v2.contracts.v1 import (
 )
 from footballai_v2.execution.contracts import ExecutionJob
 from footballai_v2.storage.local_analysis_runs import RunAlreadyExistsError
+from footballai_v2.storage.errors import InvalidStorageObjectError
 from footballai_v2.storage.ports import UploadGrant
 
 VIDEO_CONTENT_TYPES: tuple[str, ...] = (
@@ -67,7 +68,7 @@ class DirectUploadService:
 
     def authorize(self, *, content_type: str) -> AuthorizedUpload:
         if content_type not in VIDEO_CONTENT_TYPES:
-            raise ValueError("unsupported upload content type")
+            raise InvalidStorageObjectError("unsupported upload content type")
         run_id = str(uuid.uuid4())
         grant = self._authorizer.authorize_upload(
             run_id,

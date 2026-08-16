@@ -24,6 +24,13 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
     return value
 
 
+def _enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, "1" if default else "0").strip().lower()
+    if value not in {"0", "1", "false", "true"}:
+        raise ValueError(f"{name} must be 0, 1, false, or true")
+    return value in {"1", "true"}
+
+
 def main() -> None:
     configure_logging("footballai-worker")
     settings = ExecutionSettings.from_environment()
@@ -38,6 +45,7 @@ def main() -> None:
     poll = _bounded_float("FOOTBALLAI_WORKER_POLL_SECONDS", .25, .05, 60)
     claim_timeout = _bounded_float("FOOTBALLAI_JOB_CLAIM_TIMEOUT_SECONDS", 300, 1, 86400)
     delay = _bounded_float("FOOTBALLAI_DEMO_STAGE_DELAY_SECONDS", .12, 0, 60)
+    run_once = _enabled("FOOTBALLAI_WORKER_ONCE")
     stopped = False
     def stop(_signum, _frame):
         nonlocal stopped; stopped = True
@@ -55,11 +63,15 @@ def main() -> None:
     while not stopped:
         job = queue.claim(worker_id)
         if job is None:
+            if run_once:
+                break
             time.sleep(poll); continue
         status = executor.execute(job, worker_id)
         if status.value in {"succeeded", "partial"}: queue.complete(job)
         elif status.value == "cancelled": queue.cancel(job.run_id)
         else: queue.fail(job)
+        if run_once:
+            break
     worker_logger.info("worker_stopped worker_id=%s", worker_id)
 
 

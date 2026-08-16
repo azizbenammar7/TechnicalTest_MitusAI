@@ -35,6 +35,8 @@ class BlobCredentialStrategy(Protocol):
 
     def blob_write_sas(self, blob_name: str, *, expiry: datetime) -> str: ...
 
+    def blob_read_sas(self, blob_name: str, *, expiry: datetime) -> str: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ConnectionStringCredential:
@@ -56,6 +58,17 @@ class ConnectionStringCredential:
             blob_name=blob_name,
             account_key=self.account_key,
             permission=BlobSasPermissions(create=True, write=True),
+            expiry=expiry,
+            start=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+
+    def blob_read_sas(self, blob_name: str, *, expiry: datetime) -> str:
+        return generate_blob_sas(
+            account_name=self.account_name,
+            container_name=self.container,
+            blob_name=blob_name,
+            account_key=self.account_key,
+            permission=BlobSasPermissions(read=True),
             expiry=expiry,
             start=datetime.now(timezone.utc) - timedelta(minutes=5),
         )
@@ -84,6 +97,20 @@ class ManagedIdentityCredential:
             blob_name=blob_name,
             user_delegation_key=delegation_key,
             permission=BlobSasPermissions(create=True, write=True),
+            expiry=expiry,
+            start=start,
+        )
+
+    def blob_read_sas(self, blob_name: str, *, expiry: datetime) -> str:
+        start = datetime.now(timezone.utc) - timedelta(minutes=5)
+        client = self.service_client()
+        delegation_key = client.get_user_delegation_key(key_start_time=start, key_expiry_time=expiry)
+        return generate_blob_sas(
+            account_name=self.account_name,
+            container_name=self.container,
+            blob_name=blob_name,
+            user_delegation_key=delegation_key,
+            permission=BlobSasPermissions(read=True),
             expiry=expiry,
             start=start,
         )

@@ -180,7 +180,7 @@ class AnalysisCoordinator:
             models = (ModelReference("yolov8m.pt", "ultralytics-yolov8m", readiness.config.model_sha256),)
         run = AnalysisRun.new(
             data_origin=origin, input=InputReference(f"run-input://source{extension}", checksum, MEDIA_TYPES[extension]),
-            code=self._code_reference(), pipeline_version=f"{profile}/1.0.0", parameters=parameters,
+            code=self.code_reference(), pipeline_version=f"{profile}/1.0.0", parameters=parameters,
             models=models,
             stages=self._queued_stages(1, profile),
         )
@@ -215,7 +215,7 @@ class AnalysisCoordinator:
     def clone(self, run_id: str) -> AnalysisRun:
         previous = self.repository.load(run_id)
         profile = str(previous.parameters["pipeline_profile"])
-        clone = AnalysisRun.new(data_origin=previous.data_origin, input=previous.input, code=self._code_reference(), pipeline_version=previous.pipeline_version, parameters=dict(previous.parameters), models=previous.models, stages=self._queued_stages(1, profile))
+        clone = AnalysisRun.new(data_origin=previous.data_origin, input=previous.input, code=self.code_reference(), pipeline_version=previous.pipeline_version, parameters=dict(previous.parameters), models=previous.models, stages=self._queued_stages(1, profile))
         self.repository.create(clone)
         try:
             self.object_storage.copy_input(previous.run_id, clone.run_id)
@@ -239,7 +239,7 @@ class AnalysisCoordinator:
         return tuple(StageExecution(name.value, name, name not in unsupported, StageStatus.QUEUED, 0, attempt) for name in StageName)
 
     @staticmethod
-    def _code_reference() -> CodeReference:
+    def code_reference() -> CodeReference:
         revision = os.getenv("FOOTBALLAI_CODE_REVISION", "").lower()
         dirty = os.getenv("FOOTBALLAI_CODE_DIRTY")
         if not revision:

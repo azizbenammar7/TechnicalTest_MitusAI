@@ -67,6 +67,20 @@ def test_service_bus_queue_builds_without_network(tmp_path, monkeypatch):
     queue.close()
 
 
+def test_service_bus_managed_identity_builds_without_secret(tmp_path, monkeypatch):
+    monkeypatch.delenv("FOOTBALLAI_SERVICEBUS_CONNECTION_STRING", raising=False)
+    monkeypatch.setenv(
+        "FOOTBALLAI_SERVICEBUS_NAMESPACE", "footballai-stg.servicebus.windows.net"
+    )
+    monkeypatch.setenv("FOOTBALLAI_SERVICEBUS_QUEUE", "analysis-jobs")
+    settings = _local_settings(tmp_path, queue_backend="azure_service_bus")
+
+    queue = composition.create_job_queue(settings)
+
+    assert queue._client.fully_qualified_namespace == "footballai-stg.servicebus.windows.net"
+    queue.close()
+
+
 _DATABASE_URL = os.getenv("FOOTBALLAI_TEST_DATABASE_URL")
 
 

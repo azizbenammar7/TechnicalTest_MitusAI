@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import UUID4
 
 from footballai_v2.api.legacy_adapter import LegacyDataError, LegacyRunAdapter
@@ -18,6 +19,10 @@ from footballai_v2.api.models import (
     ArtifactListResponse,
     ArtifactView,
     AttemptLink,
+    DirectUploadAuthorization,
+    DirectUploadAuthorizeRequest,
+    DirectUploadAuthorizeResponse,
+    DirectUploadFinalizeRequest,
     HealthResponse,
     ManifestResponse,
     OperationResponse,
@@ -35,13 +40,30 @@ from footballai_v2.api.models import (
     StageView,
     TeamSummaryResponse,
 )
-from footballai_v2.contracts.v1 import ANALYSIS_RUN_CONTRACT_VERSION, AnalysisRun, AnalysisRunStatus, InvalidStatusTransition
+from footballai_v2.contracts.v1 import (
+    ANALYSIS_RUN_CONTRACT_VERSION,
+    AnalysisRun,
+    AnalysisRunStatus,
+    DataOrigin,
+    InvalidStatusTransition,
+)
 from footballai_v2.execution.adapters import profile_catalog
 from footballai_v2.execution.coordinator import AnalysisCoordinator, ExecutionSettings, UploadValidationError
 from footballai_v2.execution.progress import active_stage, overall_progress
 from footballai_v2.runtime_health import checks_ready
 from footballai_v2.runtime_readiness import build_readiness_probes
-from footballai_v2.storage import ManifestConflictError, RunNotFoundError
+from footballai_v2.storage import (
+    InvalidStorageObjectError,
+    ManifestConflictError,
+    RunNotFoundError,
+    StorageConflictError,
+    StorageError,
+    StorageIntegrityError,
+    StorageNotFoundError,
+    StorageProviderUnavailableError,
+)
+from footballai_v2.storage.ports import UploadAuthorizer
+from footballai_v2.storage.upload_service import DirectUploadService
 
 
 logger = logging.getLogger("footballai_v2.api")
@@ -115,6 +137,7 @@ def create_app(
     queue_root: str | Path | None = None,
     allowed_origins: Sequence[str] = ("http://localhost:5173",),
     settings: ExecutionSettings | None = None,
+    upload_service: DirectUploadService | None = None,
 ) -> FastAPI:
     """Create a local, read-oriented API bound to one configured run root."""
     execution_settings = settings or ExecutionSettings.from_environment(run_root, queue_root)
@@ -125,6 +148,15 @@ def create_app(
     # they are PostgreSQL and Blob respectively.
     repository = coordinator.repository
     object_storage = coordinator.object_storage
+    direct_upload = upload_service
+    if direct_upload is None and isinstance(object_storage, UploadAuthorizer):
+        direct_upload = DirectUploadService(
+            object_storage,
+            repository,
+            coordinator.queue,
+            max_upload_bytes=execution_settings.max_upload_bytes,
+            code_reference=coordinator.code_reference(),
+        )
     # Bounded, cached readiness probes for the configured planes (built once).
     readiness_probes = build_readiness_probes(execution_settings, repository, object_storage)
     app = FastAPI(
@@ -134,6 +166,7 @@ def create_app(
     )
     app.state.run_store = repository
     app.state.object_storage = object_storage
+    app.state.direct_upload_service = direct_upload
     origins = _validate_origins(allowed_origins, execution_settings.environment)
     app.add_middleware(
         CORSMiddleware,
@@ -142,6 +175,25 @@ def create_app(
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Accept", "Content-Type", "X-Request-ID"],
     )
+
+    @app.exception_handler(StorageError)
+    async def storage_error_handler(_request: Request, exc: StorageError) -> JSONResponse:
+        if isinstance(exc, StorageNotFoundError):
+            status, message = 404, "The requested storage object was not found."
+        elif isinstance(exc, StorageConflictError):
+            status, message = 409, "The storage object conflicts with existing immutable data."
+        elif isinstance(exc, StorageIntegrityError):
+            status, message = 422, "The storage object failed integrity verification."
+        elif isinstance(exc, InvalidStorageObjectError):
+            status, message = 422, "The uploaded object is invalid."
+        elif isinstance(exc, StorageProviderUnavailableError):
+            status, message = 503, "Object storage is temporarily unavailable."
+        else:
+            status, message = 503, "Object storage is temporarily unavailable."
+        return JSONResponse(
+            status_code=status,
+            content={"detail": {"error_code": exc.code, "message": message}},
+        )
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
@@ -197,6 +249,100 @@ def create_app(
     @app.get("/api/v1/pipeline-profiles", response_model=PipelineProfileListResponse, summary="List local execution profiles")
     def pipeline_profiles() -> PipelineProfileListResponse:
         return PipelineProfileListResponse(profiles=[PipelineProfile(**item) for item in profile_catalog(include_test=execution_settings.allow_test_profiles)])
+
+    def require_direct_upload() -> DirectUploadService:
+        if direct_upload is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "direct_upload_unavailable",
+                    "message": "Direct object-storage upload is unavailable in this deployment.",
+                },
+            )
+        return direct_upload
+
+    @app.post(
+        "/api/v1/uploads/authorize",
+        response_model=DirectUploadAuthorizeResponse,
+        summary="Authorize one bounded direct video upload",
+    )
+    def authorize_direct_upload(
+        request: DirectUploadAuthorizeRequest,
+    ) -> DirectUploadAuthorizeResponse:
+        authorized = require_direct_upload().authorize(content_type=request.content_type)
+        grant = authorized.grant
+        return DirectUploadAuthorizeResponse(
+            run_id=authorized.run_id,
+            upload=DirectUploadAuthorization(
+                method=grant.method,
+                url=grant.url,
+                headers=dict(grant.headers),
+                max_bytes=grant.max_bytes,
+                expires_at=grant.expires_at,
+                required_content_type=grant.required_content_type,
+            ),
+        )
+
+    @app.post(
+        "/api/v1/uploads/finalize",
+        response_model=QueuedRunResponse,
+        status_code=202,
+        summary="Verify a direct upload and enqueue an immutable attempt",
+    )
+    def finalize_direct_upload(request: DirectUploadFinalizeRequest) -> QueuedRunResponse:
+        match_name = request.match_name.strip()
+        if not match_name:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_metadata", "message": "Match name cannot be blank."},
+            )
+        profile = next(
+            (
+                item
+                for item in profile_catalog(include_test=execution_settings.allow_test_profiles)
+                if item["profile_id"] == request.pipeline_profile
+            ),
+            None,
+        )
+        if profile is None:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "unknown_profile", "message": "Unknown pipeline profile."},
+            )
+        if not profile["available"]:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "profile_unavailable", "message": "Selected pipeline profile is unavailable."},
+            )
+        try:
+            origin = DataOrigin(request.data_origin)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_origin", "message": "Invalid data origin."},
+            ) from exc
+        if origin is DataOrigin.LEGACY_V1:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_origin", "message": "Legacy origin is reserved for imported artifacts."},
+            )
+        run = require_direct_upload().finalize(
+            str(request.run_id),
+            profile=request.pipeline_profile,
+            data_origin=origin,
+            parameters={
+                "match_name": match_name,
+                "home_team": request.home_team.strip(),
+                "away_team": request.away_team.strip(),
+                "competition": request.competition.strip(),
+                "match_date": request.match_date.strip(),
+                "venue": request.venue.strip(),
+                "notes": request.notes.strip(),
+                "data_origin": origin.value,
+                "quality_warnings": list(profile["warnings"]),
+            },
+        )
+        return _queued_response(run)
 
     @app.post(
         "/api/v1/analyses", response_model=QueuedRunResponse, status_code=202,
@@ -393,3 +539,7 @@ def create_app(
 
 def _queued_response(run: AnalysisRun) -> QueuedRunResponse:
     return QueuedRunResponse(run_id=run.run_id, logical_analysis_id=run.logical_analysis_id, attempt_number=run.attempt_number, status=run.status.value, progress_url=f"/api/v1/runs/{run.run_id}/progress")
+    DirectUploadAuthorization,
+    DirectUploadAuthorizeRequest,
+    DirectUploadAuthorizeResponse,
+    DirectUploadFinalizeRequest,

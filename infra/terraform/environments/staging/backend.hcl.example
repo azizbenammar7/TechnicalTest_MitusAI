@@ -1,0 +1,6 @@
+# Future remote state configuration. Do not use until the dedicated state
+# account/container has been bootstrapped and an operator approves migration.
+resource_group_name  = "rg-footballai-tfstate"
+storage_account_name = "replacewithuniquestateaccount"
+container_name       = "tfstate"
+key                  = "footballai/staging.tfstate"

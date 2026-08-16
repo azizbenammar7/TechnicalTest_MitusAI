@@ -6,7 +6,10 @@ RUN python -m venv /opt/venv
 COPY v2/pyproject.toml v2/README.md ./
 COPY v2/src ./src
 COPY v2/requirements-api.txt ./requirements-api.txt
-RUN python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements-api.txt \
+COPY v2/requirements-postgres.txt ./requirements-postgres.txt
+COPY v2/requirements-azure.txt ./requirements-azure.txt
+RUN python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
+      -r requirements-api.txt -r requirements-postgres.txt -r requirements-azure.txt \
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels . \
  && /opt/venv/bin/python -m pip install --no-cache-dir --no-index --no-compile --no-deps /wheels/*.whl
 

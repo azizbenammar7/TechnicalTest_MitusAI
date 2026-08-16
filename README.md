@@ -63,6 +63,16 @@ created and no Azure credit consumed. See
 [`docs/v2/production-cloud-adapters.md`](docs/v2/production-cloud-adapters.md)
 and run the emulator-backed suite with `make p2-db-up && make p2-test`.
 
+**P3 Azure discovery and the Terraform staging foundation are complete.** The
+selected low-cost France Central topology represents Blob Storage, Service Bus,
+private PostgreSQL, ACR, a VNet-integrated Container Apps environment, separate
+managed identities, frontend/API Container Apps and an event-driven worker Job.
+Terraform formatting, validation and no-refresh planning pass, but no Azure
+resources or images have been created. Workloads remain gated off pending P4
+immutable images and an explicitly approved apply. See
+[`docs/v2/azure-staging-architecture.md`](docs/v2/azure-staging-architecture.md)
+and [`docs/v2/terraform.md`](docs/v2/terraform.md).
+
 The remaining README is the preserved V1 technical-test documentation.
 
 End-to-end pipeline: detect & track players in a full 90-minute match →

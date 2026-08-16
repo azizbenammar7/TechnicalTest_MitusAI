@@ -126,19 +126,24 @@ sequenceDiagram
   Browser->>Blob: PUT video directly (SAS)
   Browser->>API: POST finalize {run_id}
   API->>Blob: verify existence, size bound, content type
-  API->>Blob: server-side sha256 (never trust a client hash)
+  API->>Blob: verify stored sha256 metadata (never trust a client hash alone)
   API->>API: create immutable attempt (control plane) + enqueue
   API-->>Browser: queued run
 ```
 
 Authorization is bounded by object key/prefix (`runs/<run_id>/input/…`), upload
-size, expiry, and **create+write only** permission. In development/emulator the
+size, expiry, and **create+write only** permission. The mounted endpoints are
+`POST /api/v1/uploads/authorize` and `POST /api/v1/uploads/finalize`. In
+development/emulator the
 SAS is signed with the account key (Azurite); in production the credential
 strategy uses `DefaultAzureCredential` + a short-lived **user-delegation SAS**,
 so no account key exists in the process. `finalize` is idempotent: a duplicate
 finalize returns the existing attempt instead of creating a second one.
 
-The legacy multipart local upload endpoint is unchanged and keeps working.
+Finalization verifies size, media type and SHA-256 metadata, then uses a bounded
+server-side Blob copy into the immutable attempt key. The destination is
+write-once and the completed copy is re-verified for size and digest. The legacy
+multipart local upload endpoint is unchanged and keeps working.
 
 ## Azure Service Bus queue
 
@@ -192,12 +197,18 @@ adapters. It fails fast and never silently falls back.
 | `FOOTBALLAI_BLOB_CONNECTION_STRING` | Azurite/dev connection string (secret) | `azure_blob` (dev) |
 | `FOOTBALLAI_BLOB_ACCOUNT_URL` | `https://<acct>.blob.core.windows.net` | `azure_blob` (managed identity) |
 | `FOOTBALLAI_BLOB_CONTAINER` | container name (default `footballai-runs`) | `azure_blob` |
-| `FOOTBALLAI_SERVICEBUS_CONNECTION_STRING` | connection string (secret) | `azure_service_bus` |
+| `FOOTBALLAI_SERVICEBUS_CONNECTION_STRING` | connection string (secret) | `azure_service_bus` in development |
+| `FOOTBALLAI_SERVICEBUS_NAMESPACE` | fully qualified namespace | `azure_service_bus` with managed identity |
 | `FOOTBALLAI_SERVICEBUS_QUEUE` | queue name | `azure_service_bus` |
 
 Selecting a cloud backend without its configuration raises at startup with a
 clear message. Secrets are only ever read from the environment at runtime; none
 are committed.
+
+The migration history is now frozen: `0001_initial` creates the exact original
+tables and `0002_cancellation` adds/removes the cancellation column explicitly.
+Tests exercise empty-to-head and `0001`-to-`0002` upgrades and their documented
+downgrades against PostgreSQL.
 
 ## Readiness
 

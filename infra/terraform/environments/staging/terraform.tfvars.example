@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars (ignored by Git) and fill from `az account show`.
+subscription_id = "00000000-0000-0000-0000-000000000000"
+location        = "France Central"
+
+# Keep false in P3. Set true only after immutable Git-SHA images are in ACR.
+deploy_workloads = false
+image_tag        = "0000000000000000000000000000000000000000"

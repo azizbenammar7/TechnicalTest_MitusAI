@@ -86,13 +86,27 @@ def create_job_queue(settings: "ExecutionSettings", *, repository=None):
 
         return LocalFilesystemQueue(settings.queue_root)
     if backend == "azure_service_bus":
-        connection = _require_env("FOOTBALLAI_SERVICEBUS_CONNECTION_STRING", backend)
         queue_name = _require_env("FOOTBALLAI_SERVICEBUS_QUEUE", backend)
         from azure.servicebus import ServiceBusClient
 
         from footballai_v2.execution.queue.azure_service_bus import AzureServiceBusQueue
 
-        client = ServiceBusClient.from_connection_string(connection)
+        connection = os.getenv("FOOTBALLAI_SERVICEBUS_CONNECTION_STRING", "").strip()
+        namespace = os.getenv("FOOTBALLAI_SERVICEBUS_NAMESPACE", "").strip()
+        if connection:
+            client = ServiceBusClient.from_connection_string(connection)
+        elif namespace:
+            from azure.identity import DefaultAzureCredential
+
+            client = ServiceBusClient(
+                fully_qualified_namespace=namespace,
+                credential=DefaultAzureCredential(),
+            )
+        else:
+            raise BackendConfigurationError(
+                "azure_service_bus requires FOOTBALLAI_SERVICEBUS_CONNECTION_STRING "
+                "(development) or FOOTBALLAI_SERVICEBUS_NAMESPACE (managed identity)"
+            )
         return AzureServiceBusQueue(client, queue_name, repository=repository)
     raise BackendConfigurationError(f"unknown queue backend {backend!r}")
 
@@ -136,7 +150,14 @@ def validate_backend_configuration(settings: "ExecutionSettings") -> BackendSele
                 "FOOTBALLAI_BLOB_ACCOUNT_URL"
             )
     if settings.queue_backend == "azure_service_bus":
-        _require_env("FOOTBALLAI_SERVICEBUS_CONNECTION_STRING", "azure_service_bus")
+        if not (
+            os.getenv("FOOTBALLAI_SERVICEBUS_CONNECTION_STRING", "").strip()
+            or os.getenv("FOOTBALLAI_SERVICEBUS_NAMESPACE", "").strip()
+        ):
+            raise BackendConfigurationError(
+                "azure_service_bus requires FOOTBALLAI_SERVICEBUS_CONNECTION_STRING "
+                "or FOOTBALLAI_SERVICEBUS_NAMESPACE"
+            )
         _require_env("FOOTBALLAI_SERVICEBUS_QUEUE", "azure_service_bus")
     return BackendSelection(
         database_backend=settings.database_backend,

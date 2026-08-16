@@ -69,6 +69,20 @@ class ObjectStorageContract:
         with storage.materialize_input(run_id) as path:
             assert path.read_bytes() == b"video-bytes"
 
+    def test_copy_input_preserves_bytes_integrity_and_is_write_once(self, storage, run_id):
+        destination_run_id = str(uuid.uuid4())
+        content = b"immutable-source-video"
+        storage.put_input(run_id, content, extension=".mp4", content_type="video/mp4")
+
+        storage.copy_input(run_id, destination_run_id)
+
+        with storage.materialize_input(run_id) as source:
+            assert source.read_bytes() == content
+        with storage.materialize_input(destination_run_id) as destination:
+            assert destination.read_bytes() == content
+        with pytest.raises(FileExistsError):
+            storage.copy_input(run_id, destination_run_id)
+
     def test_authorize_and_finalize_upload(self, storage, run_id):
         grant = storage.authorize_upload(run_id, content_type="video/mp4", max_bytes=1024)
         assert grant.method == "PUT"

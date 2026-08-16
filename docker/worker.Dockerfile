@@ -7,8 +7,11 @@ COPY v2/pyproject.toml v2/README.md ./
 COPY v2/src ./src
 COPY v2/requirements-worker-core.txt ./requirements-worker-core.txt
 COPY v2/requirements-v1-compat.txt ./requirements-v1-compat.txt
+COPY v2/requirements-postgres.txt ./requirements-postgres.txt
+COPY v2/requirements-azure.txt ./requirements-azure.txt
 RUN sed '/^torch==/d; /^torchvision==/d' requirements-v1-compat.txt > requirements-worker-v1.txt \
- && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements-worker-core.txt \
+ && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
+      -r requirements-worker-core.txt -r requirements-postgres.txt -r requirements-azure.txt \
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
       --index-url https://download.pytorch.org/whl/cpu torch==2.13.0 torchvision==0.28.0 \
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements-worker-v1.txt \

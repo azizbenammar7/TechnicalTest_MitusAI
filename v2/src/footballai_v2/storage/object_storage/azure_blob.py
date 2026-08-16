@@ -12,12 +12,19 @@ import hashlib
 import logging
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.core.exceptions import (
+    AzureError,
+    HttpResponseError,
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 from azure.storage.blob import ContentSettings
 
 from footballai_v2.contracts.v1 import ArtifactCategory, ArtifactReference, utc_now
@@ -36,6 +43,12 @@ from footballai_v2.storage.object_storage.memory import (
     ObjectNotFoundError,
     UploadNotFoundError,
     _CONTENT_TYPE_EXTENSIONS,
+)
+from footballai_v2.storage.errors import (
+    InvalidStorageObjectError,
+    StorageConflictError,
+    StorageIntegrityError,
+    StorageProviderUnavailableError,
 )
 from footballai_v2.storage.ports import FinalizedUpload, UploadGrant
 
@@ -122,7 +135,7 @@ class AzureBlobObjectStorage:
             raise ValueError("registered artifact exceeds the configured read limit")
         content = self._client.get_blob_client(key).download_blob().readall()
         if len(content) != size or hashlib.sha256(content).hexdigest() != metadata["sha256"]:
-            raise ValueError("registered artifact integrity check failed")
+            raise StorageIntegrityError("registered artifact integrity check failed")
         return content
 
     def artifact_integrity(self, run_id: str, artifact_id: str) -> bool:
@@ -159,12 +172,15 @@ class AzureBlobObjectStorage:
         """Server-side input write (used by the legacy/local ingestion path)."""
         key = input_object_key(run_id, extension)
         digest = hashlib.sha256(content).hexdigest()
-        self._client.get_blob_client(key).upload_blob(
-            content,
-            overwrite=False,
-            content_settings=ContentSettings(content_type=content_type),
-            metadata={"sha256": digest, "size_bytes": str(len(content))},
-        )
+        try:
+            self._client.get_blob_client(key).upload_blob(
+                content,
+                overwrite=False,
+                content_settings=ContentSettings(content_type=content_type),
+                metadata={"sha256": digest, "size_bytes": str(len(content))},
+            )
+        except ResourceExistsError as exc:
+            raise ObjectAlreadyExistsError(key) from exc
         return key
 
     def put_input_file(
@@ -183,40 +199,72 @@ class AzureBlobObjectStorage:
                 digest.update(chunk)
                 size += len(chunk)
             reader.seek(0)
-            self._client.get_blob_client(key).upload_blob(
-                reader,
-                overwrite=False,
-                content_settings=ContentSettings(content_type=content_type),
-                metadata={"sha256": digest.hexdigest(), "size_bytes": str(size)},
-            )
+            try:
+                self._client.get_blob_client(key).upload_blob(
+                    reader,
+                    overwrite=False,
+                    content_settings=ContentSettings(content_type=content_type),
+                    metadata={"sha256": digest.hexdigest(), "size_bytes": str(size)},
+                )
+            except ResourceExistsError as exc:
+                raise ObjectAlreadyExistsError(key) from exc
         return key
 
     def copy_input(self, source_run_id: str, destination_run_id: str) -> None:
-        """Copy one run's single input object to another run, verifying integrity.
+        """Copy an immutable input inside Azure without routing bytes via a worker.
 
-        Streams via a bounded worker-local temporary file so a large input never
-        has to be fully resident in memory, then re-ingests through
-        ``put_input_file`` (which recomputes the checksum on the way up).
+        The source uses a short-lived read-only SAS and the destination remains
+        write-once. Azure performs the byte copy; this method waits for a bounded
+        completion and verifies the destination's size and checksum metadata.
         """
         source_key = self._single_input_key(source_run_id)
         source_blob = self._client.get_blob_client(source_key)
         properties = source_blob.get_blob_properties()
         extension = Path(source_key).suffix
-        content_type = (properties.content_settings.content_type or "application/octet-stream")
-        expected = (properties.metadata or {}).get("sha256")
-        directory = Path(tempfile.mkdtemp(prefix="footballai-copy-"))
-        target = directory / f"source{extension}"
+        metadata = properties.metadata or {}
+        expected_sha256 = metadata.get("sha256")
+        expected_size = int(metadata.get("size_bytes", properties.size))
+        if not expected_sha256 or len(expected_sha256) != 64 or expected_size != properties.size:
+            raise StorageIntegrityError("source input lacks verified integrity metadata")
+        destination_key = input_object_key(destination_run_id, extension)
+        destination_blob = self._client.get_blob_client(destination_key)
+        expiry = datetime.now(timezone.utc) + timedelta(minutes=15)
+        source_url = f"{source_blob.url}?{self._credential.blob_read_sas(source_key, expiry=expiry)}"
         try:
-            with target.open("wb") as handle:
-                source_blob.download_blob().readinto(handle)
-            if expected is not None and hashlib.sha256(target.read_bytes()).hexdigest() != expected:
-                raise ValueError("source input integrity check failed")
-            self.put_input_file(
-                destination_run_id, target, extension=extension, content_type=content_type
+            result = destination_blob.start_copy_from_url(
+                source_url,
+                metadata={"sha256": expected_sha256, "size_bytes": str(expected_size)},
+                requires_sync=False,
+                if_none_match="*",
             )
-        finally:
-            target.unlink(missing_ok=True)
-            directory.rmdir()
+            copy_id = result.get("copy_id")
+            deadline = time.monotonic() + 120
+            while result.get("copy_status") == "pending" and time.monotonic() < deadline:
+                time.sleep(0.1)
+                copied = destination_blob.get_blob_properties()
+                result = {
+                    "copy_id": copied.copy.id,
+                    "copy_status": copied.copy.status,
+                    "copy_status_description": copied.copy.status_description,
+                }
+            if result.get("copy_status") != "success":
+                if copy_id and result.get("copy_status") == "pending":
+                    destination_blob.abort_copy(copy_id)
+                destination_blob.delete_blob(delete_snapshots="include")
+                raise StorageProviderUnavailableError("server-side input copy did not complete")
+            copied = destination_blob.get_blob_properties()
+            copied_metadata = copied.metadata or {}
+            if copied.size != expected_size or copied_metadata.get("sha256") != expected_sha256:
+                destination_blob.delete_blob(delete_snapshots="include")
+                raise StorageIntegrityError("copied input integrity verification failed")
+        except (ResourceExistsError, ResourceModifiedError) as exc:
+            raise StorageConflictError("destination input already exists") from exc
+        except StorageConflictError:
+            raise
+        except (StorageIntegrityError, StorageProviderUnavailableError):
+            raise
+        except (HttpResponseError, AzureError) as exc:
+            raise StorageProviderUnavailableError("object storage copy is unavailable") from exc
 
     def has_input(self, run_id: str) -> bool:
         try:
@@ -295,19 +343,28 @@ class AzureBlobObjectStorage:
             raise UploadNotFoundError(f"no uploaded object for run {run_id}") from exc
         size = int(properties.size)
         if size < 1 or size > max_bytes:
-            raise ValueError("uploaded object size is outside the configured bound")
+            raise InvalidStorageObjectError("uploaded object size is outside the configured bound")
         content_type = (properties.content_settings.content_type or "").strip()
         if allowed_content_types and content_type not in allowed_content_types:
-            raise ValueError("uploaded object content type is not allowed")
+            raise InvalidStorageObjectError("uploaded object content type is not allowed")
         # Compute the checksum from the stored bytes so the control plane records
         # a verified identity; never trust a browser-supplied hash.
         digest = hashlib.sha256()
         stream = blob.download_blob()
         for chunk in stream.chunks():
             digest.update(chunk)
+        verified_sha256 = digest.hexdigest()
+        blob.set_blob_metadata(
+            metadata={
+                **(properties.metadata or {}),
+                "sha256": verified_sha256,
+                "size_bytes": str(size),
+            },
+            if_match=properties.etag,
+        )
         return FinalizedUpload(
             object_reference=key,
-            sha256=digest.hexdigest(),
+            sha256=verified_sha256,
             size_bytes=size,
             content_type=content_type,
         )

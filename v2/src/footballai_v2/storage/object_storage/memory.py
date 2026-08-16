@@ -21,18 +21,24 @@ from footballai_v2.storage.object_storage.keys import (
     input_object_key,
     input_prefix,
 )
+from footballai_v2.storage.errors import (
+    InvalidStorageObjectError,
+    StorageConflictError,
+    StorageIntegrityError,
+    StorageNotFoundError,
+)
 from footballai_v2.storage.ports import FinalizedUpload, UploadGrant
 
 
-class ObjectNotFoundError(FileNotFoundError):
+class ObjectNotFoundError(StorageNotFoundError):
     """Raised when a requested object does not exist."""
 
 
-class ObjectAlreadyExistsError(FileExistsError):
+class ObjectAlreadyExistsError(StorageConflictError):
     """Raised when a write would overwrite an existing (write-once) object."""
 
 
-class UploadNotFoundError(FileNotFoundError):
+class UploadNotFoundError(StorageNotFoundError):
     """Raised when finalize runs before the authorized object was uploaded."""
 
 
@@ -102,7 +108,7 @@ class InMemoryObjectStorage:
         if size > max_bytes:
             raise ValueError("registered artifact exceeds the configured read limit")
         if len(stored.data) != size or hashlib.sha256(stored.data).hexdigest() != stored.metadata["sha256"]:
-            raise ValueError("registered artifact integrity check failed")
+            raise StorageIntegrityError("registered artifact integrity check failed")
         return stored.data
 
     def artifact_integrity(self, run_id: str, artifact_id: str) -> bool:
@@ -135,6 +141,8 @@ class InMemoryObjectStorage:
 
     def put_input(self, run_id: str, content: bytes, *, extension: str, content_type: str) -> str:
         key = input_object_key(run_id, extension)
+        if key in self._objects:
+            raise ObjectAlreadyExistsError(key)
         digest = hashlib.sha256(content).hexdigest()
         self._objects[key] = _StoredObject(
             content,
@@ -228,9 +236,9 @@ class InMemoryObjectStorage:
             raise UploadNotFoundError(str(exc)) from exc
         size = int(stored.metadata["size_bytes"])
         if size < 1 or size > max_bytes:
-            raise ValueError("uploaded object size is outside the configured bound")
+            raise InvalidStorageObjectError("uploaded object size is outside the configured bound")
         if allowed_content_types and stored.content_type not in allowed_content_types:
-            raise ValueError("uploaded object content type is not allowed")
+            raise InvalidStorageObjectError("uploaded object content type is not allowed")
         return FinalizedUpload(
             object_reference=key,
             sha256=stored.metadata["sha256"],

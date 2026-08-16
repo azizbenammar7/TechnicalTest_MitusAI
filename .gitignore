@@ -65,6 +65,22 @@ htmlcov/
 compose.override.yaml
 docker-compose.override.yml
 
+# Terraform local working data, plans, variables, and state (may contain secrets)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
 # ─────────────────────────────────────────────────────────────
 # Editor / OS / tooling
 # ─────────────────────────────────────────────────────────────
