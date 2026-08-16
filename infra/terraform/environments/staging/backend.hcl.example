@@ -1,6 +1,8 @@
-# Future remote state configuration. Do not use until the dedicated state
-# account/container has been bootstrapped and an operator approves migration.
-resource_group_name  = "rg-footballai-tfstate"
-storage_account_name = "replacewithuniquestateaccount"
+# Non-secret reference matching the committed AzureRM backend configuration.
+# Authentication comes from the active Azure CLI session; never add keys here.
+resource_group_name  = "rg-footballai-tfstate-stg"
+storage_account_name = "footballaitfstg1a06f8"
 container_name       = "tfstate"
 key                  = "footballai/staging.tfstate"
+use_cli              = true
+use_azuread_auth     = true

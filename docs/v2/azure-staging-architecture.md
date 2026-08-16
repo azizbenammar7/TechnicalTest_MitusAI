@@ -1,19 +1,25 @@
 # Azure staging architecture
 
-Status: discovery and Terraform foundation complete; **nothing is deployed**.
+Status: provider registration and remote-state bootstrap complete; the
+**FootballAI staging foundation is not deployed**.
 
 ## Verified subscription discovery
 
 On 2026-08-16, Azure CLI showed the enabled **Azure for Students** subscription
-under the ESPRIT tenant. Both the resource-group and generic-resource inventories
-were empty. The resource providers required by this design were all
-`NotRegistered`: `Microsoft.App`, `Microsoft.ContainerRegistry`,
-`Microsoft.Storage`, `Microsoft.ServiceBus`, `Microsoft.DBforPostgreSQL`,
-`Microsoft.OperationalInsights`, `Microsoft.Insights`, and
-`Microsoft.ManagedIdentity`, `Microsoft.Network`, and the deferred
-`Microsoft.KeyVault`. `Microsoft.Authorization` and `Microsoft.Resources` were
-already registered. P3 did not register anything because registration
-changes subscription state.
+under the ESPRIT tenant. The pre-bootstrap resource-group and generic-resource
+inventories were empty. P3.1 registered only the namespaces required by the
+reviewed 27-resource foundation plan: `Microsoft.App`,
+`Microsoft.ContainerRegistry`, `Microsoft.Storage`, `Microsoft.ServiceBus`,
+`Microsoft.DBforPostgreSQL`, `Microsoft.OperationalInsights`,
+`Microsoft.ManagedIdentity`, and `Microsoft.Network`.
+`Microsoft.Authorization` and `Microsoft.Resources` were already registered.
+
+P3.1 then created an isolated `rg-footballai-tfstate-stg` resource group, the
+Standard LRS `footballaitfstg1a06f8` StorageV2 account, a private `tfstate`
+container, and a container-scoped `Storage Blob Data Contributor` assignment for
+the operator. Shared Key and anonymous access are disabled. Staging state uses
+the `footballai/staging.tfstate` blob with Azure CLI / Microsoft Entra
+authentication and native Blob lease locking.
 
 Provider metadata showed France Central support for Container Apps environments,
 apps and jobs, PostgreSQL Flexible Server, Service Bus, ACR, Storage and the other
@@ -25,8 +31,8 @@ GPU availability was not demonstrated and is not a dependency.
 Azure for Students has finite credit and can disable services when credit is
 exhausted. Exact credit balance and service-specific Container Apps quotas were
 not exposed by the read-only CLI calls. Container Apps environment usage can be
-checked only after an environment exists. Provider registration and quota
-availability therefore remain first-apply gates.
+checked only after an environment exists. Quota availability therefore remains
+a foundation-apply gate.
 
 ## Selected topology
 
@@ -84,15 +90,16 @@ immediately before apply.
 Three user-assigned managed identities enforce least privilege:
 
 - frontend: `AcrPull` only;
-- API: `AcrPull`, Storage Blob Data Contributor, Storage Blob Delegator, and
-  Azure Service Bus Data Sender;
-- worker: `AcrPull`, Storage Blob Data Contributor, and Azure Service Bus Data
-  Receiver.
+- API: `AcrPull`, container-scoped Storage Blob Data Contributor,
+  account-scoped Storage Blob Delegator, and queue-scoped Azure Service Bus Data
+  Sender;
+- worker: `AcrPull`, container-scoped Storage Blob Data Contributor, and
+  queue-scoped Azure Service Bus Data Receiver.
 
 Local Terraform uses the authenticated Azure CLI. Future CI should use GitHub
 OIDC federation, never a client secret. Workload resources are represented in
 Terraform but `deploy_workloads` defaults to `false`; P4 must first publish
 images tagged with an immutable 40-character Git SHA.
 
-No Azure resource, provider registration, image push, custom domain, GitHub
-workflow, or real-Azure integration test was performed in P3.
+No image push, Container App or Job deployment, custom domain, GPU resource,
+cloud analysis, or 27-resource staging foundation apply was performed in P3.1.

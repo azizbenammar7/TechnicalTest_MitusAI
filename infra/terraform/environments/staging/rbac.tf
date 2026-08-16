@@ -8,7 +8,7 @@ locals {
 
   api_roles = {
     blob_contributor = {
-      scope = azurerm_storage_account.staging.id
+      scope = azurerm_storage_container.runs.id
       role  = "Storage Blob Data Contributor"
     }
     blob_delegator = {
@@ -16,7 +16,7 @@ locals {
       role  = "Storage Blob Delegator"
     }
     servicebus_sender = {
-      scope = azurerm_servicebus_namespace.staging.id
+      scope = azurerm_servicebus_queue.analysis.id
       role  = "Azure Service Bus Data Sender"
     }
     acr_pull = {
@@ -27,11 +27,11 @@ locals {
 
   worker_roles = {
     blob_contributor = {
-      scope = azurerm_storage_account.staging.id
+      scope = azurerm_storage_container.runs.id
       role  = "Storage Blob Data Contributor"
     }
     servicebus_receiver = {
-      scope = azurerm_servicebus_namespace.staging.id
+      scope = azurerm_servicebus_queue.analysis.id
       role  = "Azure Service Bus Data Receiver"
     }
     acr_pull = {
