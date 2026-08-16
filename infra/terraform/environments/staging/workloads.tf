@@ -19,7 +19,7 @@ locals {
 resource "azurerm_container_app" "api" {
   count = var.deploy_workloads ? 1 : 0
 
-  name                         = "ca-${local.name_prefix}-api"
+  name                         = local.api_app_name
   container_app_environment_id = azurerm_container_app_environment.staging.id
   resource_group_name          = azurerm_resource_group.staging.name
   revision_mode                = "Single"
@@ -53,7 +53,7 @@ resource "azurerm_container_app" "api" {
         for_each = merge(local.common_cloud_environment, {
           AZURE_CLIENT_ID             = azurerm_user_assigned_identity.api.client_id
           FOOTBALLAI_API_WORKERS      = "1"
-          FOOTBALLAI_V2_CORS_ORIGINS  = "https://same-origin.invalid"
+          FOOTBALLAI_V2_CORS_ORIGINS  = local.frontend_origin
           FOOTBALLAI_MAX_UPLOAD_BYTES = tostring(8 * 1024 * 1024 * 1024)
           FOOTBALLAI_DATABASE_URL     = null
         })
@@ -96,7 +96,7 @@ resource "azurerm_container_app" "api" {
 resource "azurerm_container_app" "frontend" {
   count = var.deploy_workloads ? 1 : 0
 
-  name                         = "ca-${local.name_prefix}-frontend"
+  name                         = local.frontend_app_name
   container_app_environment_id = azurerm_container_app_environment.staging.id
   resource_group_name          = azurerm_resource_group.staging.name
   revision_mode                = "Single"
@@ -128,7 +128,17 @@ resource "azurerm_container_app" "frontend" {
 
       env {
         name  = "FOOTBALLAI_API_UPSTREAM"
-        value = "https://${azurerm_container_app.api[0].latest_revision_fqdn}"
+        value = local.api_origin
+      }
+
+      env {
+        name  = "FOOTBALLAI_FRONTEND_UPLOAD_MODE"
+        value = "direct"
+      }
+
+      env {
+        name  = "FOOTBALLAI_BLOB_CONNECT_SRC"
+        value = local.blob_origin
       }
 
       liveness_probe {
@@ -225,5 +235,55 @@ resource "azurerm_container_app_job" "worker" {
   }
 
   depends_on = [azurerm_role_assignment.worker]
+  tags       = var.tags
+}
+
+resource "azurerm_container_app_job" "migration" {
+  count = var.deploy_workloads ? 1 : 0
+
+  name                         = "caj-${local.name_prefix}-db-migrate"
+  location                     = azurerm_resource_group.staging.location
+  resource_group_name          = azurerm_resource_group.staging.name
+  container_app_environment_id = azurerm_container_app_environment.staging.id
+  replica_timeout_in_seconds   = 600
+  replica_retry_limit          = 1
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.api.id]
+  }
+
+  registry {
+    server   = azurerm_container_registry.staging.login_server
+    identity = azurerm_user_assigned_identity.api.id
+  }
+
+  secret {
+    name  = "database-url"
+    value = local.database_url
+  }
+
+  manual_trigger_config {
+    parallelism              = 1
+    replica_completion_count = 1
+  }
+
+  template {
+    container {
+      name    = "migration"
+      image   = "${azurerm_container_registry.staging.login_server}/footballai-api:${var.image_tag}"
+      cpu     = 0.25
+      memory  = "0.5Gi"
+      command = ["python", "-m", "alembic"]
+      args    = ["-c", "/opt/footballai/alembic.ini", "upgrade", "head"]
+
+      env {
+        name        = "FOOTBALLAI_DATABASE_URL"
+        secret_name = "database-url"
+      }
+    }
+  }
+
+  depends_on = [azurerm_role_assignment.api]
   tags       = var.tags
 }

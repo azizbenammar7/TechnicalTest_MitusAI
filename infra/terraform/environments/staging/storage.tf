@@ -18,6 +18,14 @@ resource "azurerm_storage_account" "staging" {
   blob_properties {
     versioning_enabled = true
 
+    cors_rule {
+      allowed_headers    = ["Content-Type", "x-ms-blob-type"]
+      allowed_methods    = ["HEAD", "OPTIONS", "PUT"]
+      allowed_origins    = [local.frontend_origin]
+      exposed_headers    = ["ETag", "x-ms-request-id"]
+      max_age_in_seconds = 600
+    }
+
     delete_retention_policy {
       days = 7
     }

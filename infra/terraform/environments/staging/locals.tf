@@ -12,4 +12,11 @@ locals {
   database_name       = "footballai"
   queue_name          = "analysis-jobs"
   blob_container_name = "footballai-runs"
+  frontend_app_name   = "ca-${local.name_prefix}-frontend"
+  frontend_fqdn       = "${local.frontend_app_name}.${azurerm_container_app_environment.staging.default_domain}"
+  frontend_origin     = "https://${local.frontend_fqdn}"
+  api_app_name        = "ca-${local.name_prefix}-api"
+  api_fqdn            = "${local.api_app_name}.${azurerm_container_app_environment.staging.default_domain}"
+  api_origin          = "https://${local.api_fqdn}"
+  blob_origin         = trimsuffix(azurerm_storage_account.staging.primary_blob_endpoint, "/")
 }

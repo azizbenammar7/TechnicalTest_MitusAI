@@ -3,6 +3,8 @@ set -eu
 
 api_base="${FOOTBALLAI_FRONTEND_API_BASE:-}"
 api_upstream="${FOOTBALLAI_API_UPSTREAM:-http://api:8000}"
+upload_mode="${FOOTBALLAI_FRONTEND_UPLOAD_MODE:-multipart}"
+blob_connect_src="${FOOTBALLAI_BLOB_CONNECT_SRC:-}"
 if [ -n "$api_base" ] \
   && ! printf '%s\n' "$api_base" | grep -Eq '^http://(localhost|127[.]0[.]0[.]1):8000$'; then
   echo "FOOTBALLAI_FRONTEND_API_BASE must be blank (same-origin) or a local API URL on port 8000." >&2
@@ -15,9 +17,26 @@ if ! printf '%s\n' "$api_upstream" \
   exit 2
 fi
 
-printf 'window.__FOOTBALLAI_CONFIG__ = { apiBase: "%s" };\n' "$api_base" \
+if ! printf '%s\n' "$upload_mode" | grep -Eq '^(multipart|direct)$'; then
+  echo "FOOTBALLAI_FRONTEND_UPLOAD_MODE must be multipart or direct." >&2
+  exit 2
+fi
+
+if [ -n "$blob_connect_src" ] \
+  && ! printf '%s\n' "$blob_connect_src" | grep -Eq '^https://[a-z0-9]+[.]blob[.]core[.]windows[.]net$'; then
+  echo "FOOTBALLAI_BLOB_CONNECT_SRC must be blank or an Azure Blob HTTPS account origin." >&2
+  exit 2
+fi
+
+if [ "$upload_mode" = "direct" ] && [ -z "$blob_connect_src" ]; then
+  echo "Direct upload requires FOOTBALLAI_BLOB_CONNECT_SRC." >&2
+  exit 2
+fi
+
+printf 'window.__FOOTBALLAI_CONFIG__ = { apiBase: "%s", uploadMode: "%s" };\n' "$api_base" "$upload_mode" \
   > /tmp/footballai-config.js
 
-sed "s|__FOOTBALLAI_API_UPSTREAM__|$api_upstream|g" \
+sed -e "s|__FOOTBALLAI_API_UPSTREAM__|$api_upstream|g" \
+  -e "s|__FOOTBALLAI_BLOB_CONNECT_SRC__|$blob_connect_src|g" \
   /etc/nginx/footballai-nginx.conf.template \
   > /tmp/footballai-nginx.conf

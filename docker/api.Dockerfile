@@ -29,11 +29,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FOOTBALLAI_API_WORKERS=1 \
     PATH=/opt/venv/bin:$PATH
 
+WORKDIR /opt/footballai
 RUN apk add --no-cache ffmpeg \
  && addgroup -S -g 10001 footballai \
  && adduser -S -D -H -u 10001 -G footballai footballai \
  && install -d -o footballai -g footballai /var/lib/footballai/runs /var/lib/footballai/queue
 COPY --from=build /opt/venv /opt/venv
+COPY --chown=footballai:footballai v2/alembic.ini ./alembic.ini
+COPY --chown=footballai:footballai v2/migrations ./migrations
 
 USER footballai:footballai
 EXPOSE 8000

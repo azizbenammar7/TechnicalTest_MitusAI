@@ -14,7 +14,9 @@ COPY --chown=nginx:nginx docker/40-footballai-runtime-config.sh /docker-entrypoi
 COPY --chown=nginx:nginx --from=build /build/dist /usr/share/nginx/html
 
 ENV FOOTBALLAI_FRONTEND_API_BASE="" \
-    FOOTBALLAI_API_UPSTREAM="http://api:8000"
+    FOOTBALLAI_API_UPSTREAM="http://api:8000" \
+    FOOTBALLAI_FRONTEND_UPLOAD_MODE="multipart" \
+    FOOTBALLAI_BLOB_CONNECT_SRC=""
 EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1

@@ -41,3 +41,7 @@ output "postgres_host" {
 output "worker_job_name" {
   value = var.deploy_workloads ? azurerm_container_app_job.worker[0].name : null
 }
+
+output "migration_job_name" {
+  value = var.deploy_workloads ? azurerm_container_app_job.migration[0].name : null
+}
