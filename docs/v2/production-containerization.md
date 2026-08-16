@@ -135,6 +135,13 @@ configured claim timeout.
 
 ## P2 provider-neutral foundation
 
+> **Status update:** the adapters described below as "next" are now implemented
+> and validated against local emulators in P2. See
+> [`production-cloud-adapters.md`](production-cloud-adapters.md) for the current
+> state, schema, direct-upload flow, Service Bus lock lifecycle, composition
+> root, and what still requires real Azure. The section below is retained as the
+> original design rationale.
+
 ### Queue
 
 `JobQueue` is the existing provider-neutral port. `create_job_queue` is now the

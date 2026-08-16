@@ -1,0 +1,247 @@
+# P2 — Production cloud adapters
+
+Status legend used throughout this document:
+
+- **Implemented** — code exists and passes deterministic unit/contract tests.
+- **Emulator-validated** — additionally exercised against a real local emulator
+  (PostgreSQL container, Azurite Blob).
+- **Real-Azure pending** — not yet run against a real Azure resource. No Azure
+  resources were created and no Azure credit was consumed in P2.
+
+| Adapter | Port | State |
+|---|---|---|
+| `PostgreSQLAnalysisRepository` | `AnalysisRepository` (control plane) | **Emulator-validated** (PostgreSQL 16 container) |
+| `AzureBlobObjectStorage` | `ObjectStorage` + `UploadAuthorizer` (data plane) | **Emulator-validated** (Azurite) · real-Azure pending |
+| `AzureServiceBusQueue` | `JobQueue` | **Implemented** (fake-broker contract) · real-Azure pending |
+
+P2 keeps the `footballai.analysis-run/v1` contract untouched. Cloud adapters
+round-trip the immutable `AnalysisRun` manifest through `to_dict()/from_dict()`,
+so terminal immutability, the retry chain, attempt-specific provenance, and
+artifact integrity metadata are preserved by construction.
+
+## Planes
+
+The local `LocalAnalysisRunStore` fuses two responsibilities that the cloud
+architecture separates:
+
+```mermaid
+flowchart LR
+  subgraph Control plane
+    R[AnalysisRepository]
+  end
+  subgraph Data plane
+    O[ObjectStorage]
+  end
+  subgraph Messaging
+    Q[JobQueue]
+  end
+  R -.local_manifest.-> L1[LocalAnalysisRunStore]
+  R -.postgres.-> PG[PostgreSQLAnalysisRepository]
+  O -.local.-> L2[LocalAnalysisRunStore]
+  O -.azure_blob.-> B[AzureBlobObjectStorage]
+  Q -.local.-> FQ[LocalFilesystemQueue]
+  Q -.azure_service_bus.-> SB[AzureServiceBusQueue]
+```
+
+- **Control plane (PostgreSQL):** structured, transactional lifecycle — logical
+  analyses, immutable attempts, stage state, artifact *metadata*, audit events.
+  No video bytes, no large artifacts.
+- **Data plane (Azure Blob):** uploaded videos and published artifact bytes,
+  addressed by opaque, run-scoped object references.
+- **Messaging (Azure Service Bus):** at-least-once job delivery; the control
+  plane remains the authority on whether a job is still executable.
+
+## PostgreSQL control plane
+
+**Decision (dependencies):** SQLAlchemy Core + Alembic + psycopg 3, *not* an ORM.
+The domain `AnalysisRun` is already a rich immutable dataclass with its own
+validation and serialization; an ORM would duplicate and fight it. Core gives
+explicit SQL and explicit transactions, and the manifest is stored verbatim as
+authoritative JSONB with scalar/relational projections for querying.
+
+Schema (`0001_initial`):
+
+- `logical_analyses` — one row per logical analysis (the retry-chain grouping).
+- `analysis_attempts` — one immutable attempt: `run_id` PK, `logical_analysis_id`,
+  `attempt_number`, `previous_attempt_run_id`, `status`, `data_origin`,
+  `pipeline_version`, `contract_version`, authoritative `manifest` JSONB, a
+  monotonic `version` (optimistic token), and `created/started/completed_at`.
+  `UNIQUE(logical_analysis_id, attempt_number)`.
+- `stage_executions` — per-attempt stage projection.
+- `artifact_metadata` — per-attempt artifact **metadata only** (id, category,
+  path, sha256, size, schema version).
+- `audit_events` — append-only lifecycle log.
+
+**Transactions & concurrency.** Every read-modify-write locks the attempt row
+with `SELECT … FOR UPDATE`, validates the transition against the freshly-read
+current state, then writes — so two racing writers (e.g. an API cancel and a
+worker completion) are serialized and the loser correctly observes a terminal
+state and is rejected. A monotonic `version` column additionally supports
+optimistic rejection when a caller passes `expected_version`.
+
+```mermaid
+sequenceDiagram
+  participant W as Writer
+  participant DB as PostgreSQL
+  W->>DB: BEGIN
+  W->>DB: SELECT ... FOR UPDATE (lock attempt row)
+  DB-->>W: current manifest + version
+  W->>W: ensure_transition_allowed(current, updated)
+  W->>DB: UPDATE manifest, version+1, projections
+  W->>DB: INSERT audit_event
+  W->>DB: COMMIT
+```
+
+The transition/immutability rules live once in `storage/lifecycle.py` and are
+shared by the local and PostgreSQL adapters, so they cannot diverge.
+
+**Migrations are explicit** (never a startup side effect):
+
+```bash
+make p2-db-up        # PostgreSQL + Azurite dev stack (compose.p2.yaml)
+make p2-db-migrate   # alembic upgrade head
+make p2-test         # migrate, then run v2 tests against the emulators
+make p2-db-down      # tear down (disposable data)
+```
+
+`PostgreSQLAnalysisRepository.verify_schema()` fails fast if the applied Alembic
+revision does not match the expected `SCHEMA_REVISION`.
+
+## Azure Blob data plane & direct upload
+
+Azure SDK usage is confined to `storage/object_storage/azure_blob.py` and its
+credential strategy; callers only exchange opaque object references and
+provider-neutral values. The container is **private**; browsers never receive a
+storage account key and cannot address arbitrary blobs.
+
+Direct upload replaces "browser streams a multi-GiB video through FastAPI":
+
+```mermaid
+sequenceDiagram
+  participant Browser
+  participant API as FastAPI (DirectUploadService)
+  participant Blob as Azure Blob (private)
+  Browser->>API: POST authorize {content_type}
+  API-->>Browser: run_id + write-only SAS (single blob, short-lived)
+  Browser->>Blob: PUT video directly (SAS)
+  Browser->>API: POST finalize {run_id}
+  API->>Blob: verify existence, size bound, content type
+  API->>Blob: server-side sha256 (never trust a client hash)
+  API->>API: create immutable attempt (control plane) + enqueue
+  API-->>Browser: queued run
+```
+
+Authorization is bounded by object key/prefix (`runs/<run_id>/input/…`), upload
+size, expiry, and **create+write only** permission. In development/emulator the
+SAS is signed with the account key (Azurite); in production the credential
+strategy uses `DefaultAzureCredential` + a short-lived **user-delegation SAS**,
+so no account key exists in the process. `finalize` is idempotent: a duplicate
+finalize returns the existing attempt instead of creating a second one.
+
+The legacy multipart local upload endpoint is unchanged and keeps working.
+
+## Azure Service Bus queue
+
+Service Bus is at-least-once infrastructure, so the execution path is
+idempotent and the **control plane is the final authority** on executability.
+
+```mermaid
+flowchart TD
+  API[FastAPI] -->|enqueue run_id, logical_id, attempt| SB[(Service Bus)]
+  SB --> C{claim}
+  C -->|run terminal in repo| Drain[complete / drain duplicate]
+  C -->|unknown / poison / over-delivered| DLQ[dead-letter]
+  C -->|executable| Work[worker executes + LockRenewer keeps lock alive]
+  Work -->|analysis recorded terminal| Done[complete message]
+  Work -.worker crash.-> Expire[lock expires -> redelivery]
+```
+
+- **Enqueue** carries stable identifiers (`run_id`, `logical_analysis_id`,
+  `attempt_number`) with the job id as the message id.
+- **Claim** consults the repository: an already-terminal run drains the
+  duplicate (complete); an unknown run, an unparseable body, or a message past
+  `max_delivery` is dead-lettered; otherwise the job is handed back with a
+  background `LockRenewer` keeping the peek-lock alive.
+- **Complete/fail** both settle by completing the message: a recorded analysis
+  failure is a terminal, immutable outcome — retrying is a *new* run via the
+  retry flow, not a redelivery. Infrastructure failures never call `fail()`; the
+  lock simply expires and Service Bus redelivers.
+- **Cancellation** is control-plane driven; the queue message is drained on a
+  later claim once the run is terminal.
+
+**Lock renewal.** A FootballAI analysis can outlast one lock. `LockRenewer` runs
+on a background thread, renews on a bounded interval, stops on completion,
+failure, or shutdown, and is capped by a maximum lifetime so a leaked renewer
+can never hold a lock forever. It is provider-neutral and unit-tested with a
+fake (no 95-minute inference test).
+
+**Duplicate delivery** cannot create a second attempt: `create` is keyed by
+`run_id` (PK), and `finalize`/claim treat an existing terminal run idempotently.
+
+## Composition root & configuration
+
+`footballai_v2/composition.py` is the only place that turns backend names into
+adapters. It fails fast and never silently falls back.
+
+| Variable | Values | Required when |
+|---|---|---|
+| `FOOTBALLAI_DATABASE_BACKEND` | `local_manifest` \| `postgres` | — |
+| `FOOTBALLAI_OBJECT_STORAGE_BACKEND` | `local` \| `azure_blob` | — |
+| `FOOTBALLAI_QUEUE_BACKEND` | `local` \| `azure_service_bus` | — |
+| `FOOTBALLAI_DATABASE_URL` | connection string (secret) | `database_backend=postgres` |
+| `FOOTBALLAI_BLOB_CONNECTION_STRING` | Azurite/dev connection string (secret) | `azure_blob` (dev) |
+| `FOOTBALLAI_BLOB_ACCOUNT_URL` | `https://<acct>.blob.core.windows.net` | `azure_blob` (managed identity) |
+| `FOOTBALLAI_BLOB_CONTAINER` | container name (default `footballai-runs`) | `azure_blob` |
+| `FOOTBALLAI_SERVICEBUS_CONNECTION_STRING` | connection string (secret) | `azure_service_bus` |
+| `FOOTBALLAI_SERVICEBUS_QUEUE` | queue name | `azure_service_bus` |
+
+Selecting a cloud backend without its configuration raises at startup with a
+clear message. Secrets are only ever read from the environment at runtime; none
+are committed.
+
+## Readiness
+
+`/health` stays simple process liveness. `runtime_readiness.CapabilityProbe`
+provides bounded, TTL-cached capability checks (`postgres_capability` verifies
+connectivity + migration revision; `blob_capability` verifies the private
+container is reachable) so readiness never turns into an expensive per-request
+operation and a transient cloud outage never restarts a healthy process.
+
+## Test strategy
+
+- **Fast/deterministic** (no emulator): domain, contract suites against the
+  in-memory / local reference adapters, the Service Bus adapter against a
+  faithful fake broker, the lock renewer, the direct-upload service, and
+  composition validation.
+- **Emulator-validated** (opt-in via env): `PostgreSQLAnalysisRepository`
+  against a PostgreSQL container; `AzureBlobObjectStorage` against Azurite,
+  including a real SAS `PUT` upload followed by checksum-verified finalize.
+
+Contract suites (`tests/contracts/`) run the same behavioural tests across
+adapters:
+
+```
+AnalysisRepository  →  LocalAnalysisRunStore   +  PostgreSQLAnalysisRepository
+ObjectStorage       →  InMemoryObjectStorage   +  AzureBlobObjectStorage (Azurite)
+JobQueue            →  LocalFilesystemQueue     +  AzureServiceBusQueue (fake broker)
+```
+
+## Known limitations / what needs real Azure
+
+- **Azure Service Bus** is validated only against a fake broker. Behaviour
+  against a real namespace (lock durations, DLQ, duplicate detection settings)
+  is **real-Azure pending**.
+- **Azure Blob** is validated against Azurite. User-delegation SAS via Managed
+  Identity is implemented but only exercisable against a real account
+  (**real-Azure pending**).
+- The synchronous multipart ingestion coordinator and the worker execution path
+  still run on the local manifest + local object storage. Running inference with
+  the PostgreSQL control plane + Blob data plane requires splitting the executor
+  across the two ports (it currently depends on the fused `LocalAnalysisRunStore`).
+  This is the primary remaining integration and is deferred to the next phase.
+
+## What remains for P3
+
+Real Azure provisioning (Terraform), an Azure staging environment, wiring the
+cloud adapters into a deployed API/worker, and validating each adapter against
+real Azure resources. No Azure resources are created until then.

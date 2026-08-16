@@ -1,0 +1,53 @@
+"""Bounded, cached capability probes for configured production dependencies.
+
+Readiness must reflect whether a dependency can actually serve requests without
+turning into an expensive operation on every probe. Each check is wrapped in a
+short TTL cache so a burst of readiness requests performs at most one real check
+per interval. Liveness (``/health``) never depends on these -- a transient cloud
+outage must not restart a healthy process.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Callable
+
+
+class CapabilityProbe:
+    """Cache a boolean capability check for a bounded interval."""
+
+    def __init__(self, check: Callable[[], bool], *, ttl_seconds: float = 10.0) -> None:
+        self._check = check
+        self._ttl = ttl_seconds
+        self._checked_at = 0.0
+        self._ready = False
+
+    def status(self) -> str:
+        now = time.monotonic()
+        if now - self._checked_at >= self._ttl:
+            try:
+                self._ready = bool(self._check())
+            except Exception:  # noqa: BLE001 - readiness never raises
+                self._ready = False
+            self._checked_at = now
+        return "ready" if self._ready else "unavailable"
+
+
+def postgres_capability(engine) -> bool:
+    """True when PostgreSQL answers and its schema is at the expected revision."""
+    from sqlalchemy import text
+
+    from footballai_v2.storage.postgres.schema import SCHEMA_REVISION
+
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+        if not connection.dialect.has_table(connection, "alembic_version"):
+            return False
+        row = connection.exec_driver_sql("SELECT version_num FROM alembic_version").first()
+    return bool(row) and row[0] == SCHEMA_REVISION
+
+
+def blob_capability(container_client) -> bool:
+    """True when the configured private Blob container is reachable."""
+    container_client.get_container_properties()
+    return True

@@ -39,10 +39,21 @@ detector-neutral V2 production engine.
 
 Production Platform status: **P1 containerized service boundaries are
 implemented and locally validated** for the compiled React frontend, FastAPI
-API, and long-lived worker. The stack currently retains the local filesystem
-queue and run store while P2 provider adapters are prepared. Start it with
-`make p1-build && make p1-up`; see
+API, and long-lived worker. Start the local stack with `make p1-build && make
+p1-up`; see
 [`docs/v2/production-containerization.md`](docs/v2/production-containerization.md).
+
+**P2 cloud adapters are implemented behind the provider-neutral ports**:
+`PostgreSQLAnalysisRepository` (control plane, emulator-validated against a
+PostgreSQL container), `AzureBlobObjectStorage` with a direct-upload boundary
+(data plane, emulator-validated against Azurite), and `AzureServiceBusQueue`
+(implemented; validated against a faithful fake broker — real-Azure validation
+pending). A fail-fast composition root selects backends via
+`FOOTBALLAI_{DATABASE,OBJECT_STORAGE,QUEUE}_BACKEND`; the local adapters remain
+the default and the running execution path. No Azure resources were created and
+no Azure credit consumed. See
+[`docs/v2/production-cloud-adapters.md`](docs/v2/production-cloud-adapters.md)
+and run the emulator-backed suite with `make p2-db-up && make p2-test`.
 
 The remaining README is the preserved V1 technical-test documentation.
 

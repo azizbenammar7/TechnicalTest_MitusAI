@@ -25,7 +25,7 @@ def test_queue_factory_preserves_local_adapter_and_rejects_unimplemented_cloud(t
         create_job_queue("azure_service_bus", tmp_path / "queue")
 
 
-def test_environment_configuration_selects_only_implemented_adapters(tmp_path, monkeypatch):
+def test_environment_configuration_defaults_to_local_adapters(tmp_path, monkeypatch):
     monkeypatch.setenv("FOOTBALLAI_ENVIRONMENT", "staging")
     monkeypatch.setenv("FOOTBALLAI_V2_RUN_ROOT", str(tmp_path / "runs"))
     monkeypatch.setenv("FOOTBALLAI_V2_QUEUE_ROOT", str(tmp_path / "queue"))
@@ -35,9 +35,26 @@ def test_environment_configuration_selects_only_implemented_adapters(tmp_path, m
     assert settings.object_storage_backend == "local"
     assert settings.database_backend == "local_manifest"
 
+
+def test_cloud_backend_without_configuration_fails_fast(tmp_path, monkeypatch):
+    monkeypatch.setenv("FOOTBALLAI_V2_RUN_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setenv("FOOTBALLAI_V2_QUEUE_ROOT", str(tmp_path / "queue"))
     monkeypatch.setenv("FOOTBALLAI_QUEUE_BACKEND", "azure_service_bus")
-    with pytest.raises(ValueError, match="not implemented"):
+    monkeypatch.delenv("FOOTBALLAI_SERVICEBUS_CONNECTION_STRING", raising=False)
+    # No silent fallback: a selected cloud backend without its configuration is
+    # rejected at construction with a clear message.
+    with pytest.raises(ValueError, match="FOOTBALLAI_SERVICEBUS_CONNECTION_STRING"):
         ExecutionSettings.from_environment()
+
+
+def test_cloud_backend_with_configuration_is_accepted(tmp_path, monkeypatch):
+    monkeypatch.setenv("FOOTBALLAI_V2_RUN_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setenv("FOOTBALLAI_V2_QUEUE_ROOT", str(tmp_path / "queue"))
+    monkeypatch.setenv("FOOTBALLAI_QUEUE_BACKEND", "azure_service_bus")
+    monkeypatch.setenv("FOOTBALLAI_SERVICEBUS_CONNECTION_STRING", "Endpoint=sb://example/;SharedAccessKeyName=x;SharedAccessKey=y")
+    monkeypatch.setenv("FOOTBALLAI_SERVICEBUS_QUEUE", "footballai-jobs")
+    settings = ExecutionSettings.from_environment()
+    assert settings.queue_backend == "azure_service_bus"
 
 
 def test_production_cors_allows_explicit_https_origin(tmp_path):

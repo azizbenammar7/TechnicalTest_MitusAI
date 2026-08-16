@@ -1,0 +1,6 @@
+# PostgreSQL control-plane lock (P2). Installed into the API image, which owns
+# the analysis-run lifecycle. Sync psycopg + SQLAlchemy Core + Alembic; no ORM.
+SQLAlchemy==2.0.52
+psycopg==3.3.4
+alembic==1.19.1
+Mako==1.4.1

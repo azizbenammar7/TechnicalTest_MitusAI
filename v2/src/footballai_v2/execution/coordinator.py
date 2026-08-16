@@ -17,7 +17,6 @@ from footballai_v2.contracts.v1 import (
 from footballai_v2.execution.adapters import profile_catalog
 from footballai_v2.execution.adapters.v1_compat_runtime import check_v1_compat_readiness
 from footballai_v2.execution.contracts import ExecutionJob
-from footballai_v2.execution.queue import create_job_queue
 from footballai_v2.storage import LocalAnalysisRunStore, ManifestConflictError
 
 
@@ -47,16 +46,11 @@ class ExecutionSettings:
     def __post_init__(self) -> None:
         if self.environment not in {"local", "staging", "production", "test"}:
             raise ValueError("FOOTBALLAI_ENVIRONMENT must be local, staging, production, or test")
-        implemented = {
-            "queue": (self.queue_backend, "local"),
-            "object storage": (self.object_storage_backend, "local"),
-            "database": (self.database_backend, "local_manifest"),
-        }
-        for label, (configured, supported) in implemented.items():
-            if configured != supported:
-                raise ValueError(
-                    f"The configured {label} backend {configured!r} is not implemented; expected {supported!r}"
-                )
+        # Backend selection and its required configuration are validated by the
+        # composition root, which fails fast and never silently falls back.
+        from footballai_v2.composition import validate_backend_configuration
+
+        validate_backend_configuration(self)
         if self.max_upload_bytes < 1:
             raise ValueError("FOOTBALLAI_MAX_UPLOAD_BYTES must be positive")
         if self.max_video_duration_seconds <= 0:
@@ -85,9 +79,20 @@ class ExecutionSettings:
 
 class AnalysisCoordinator:
     def __init__(self, settings: ExecutionSettings) -> None:
+        from footballai_v2 import composition
+        from footballai_v2.composition import BackendConfigurationError
+
         self.settings = settings
+        if settings.database_backend != "local_manifest" or settings.object_storage_backend != "local":
+            raise BackendConfigurationError(
+                "the synchronous multipart ingestion coordinator supports only the "
+                "local manifest control plane and local object storage; use the "
+                "direct-upload cloud pipeline for azure_blob or postgres backends"
+            )
         self.store = LocalAnalysisRunStore(settings.run_root)
-        self.queue = create_job_queue(settings.queue_backend, settings.queue_root)
+        # The queue backend is swappable here; the local manifest store doubles as
+        # the control-plane authority the Azure queue consults for idempotency.
+        self.queue = composition.create_job_queue(settings, repository=self.store)
         self.upload_root = self.store.root / ".uploads"
         self.upload_root.mkdir(exist_ok=True)
 

@@ -1,0 +1,33 @@
+# Local P2 dependency stack: PostgreSQL control plane + Azurite Blob emulator.
+#
+# This file exists ONLY for local development and integration testing of the P2
+# cloud adapters. It is never used for staging or production, where PostgreSQL
+# credentials come from a runtime secret and Blob/Service Bus use Managed
+# Identity. The credentials below are deliberately weak, well-known, and
+# non-production.
+name: footballai-p2-deps
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: footballai
+      # Development-only, non-production password. Do NOT reuse anywhere real.
+      POSTGRES_PASSWORD: devonly_local_p2
+      POSTGRES_DB: footballai_p2
+    ports:
+      - "55432:5432"
+    # Ephemeral data: the dev database is disposable and re-migrated on demand.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U footballai -d footballai_p2"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--skipApiVersionCheck"]
+    ports:
+      - "10000:10000"
