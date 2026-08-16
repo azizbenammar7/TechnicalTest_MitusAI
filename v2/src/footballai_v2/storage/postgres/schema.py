@@ -29,7 +29,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 # Bumped whenever a migration changes the control-plane schema. Readiness and
 # startup compare this against the applied Alembic revision.
-SCHEMA_REVISION = "0001_initial"
+SCHEMA_REVISION = "0002_cancellation"
 
 METADATA = MetaData()
 
@@ -61,6 +61,10 @@ analysis_attempts = Table(
     Column("manifest", JSONB, nullable=False),
     # Monotonic optimistic-concurrency token; increments on every write.
     Column("version", Integer, nullable=False),
+    # Control-plane cancellation intent. Set by the API; observed by the worker
+    # at safe checkpoints. Never carried in the manifest -- it is a request flag,
+    # not part of the immutable attempt contract.
+    Column("cancel_requested", Boolean, nullable=False, server_default="false"),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("started_at", DateTime(timezone=True), nullable=True),
     Column("completed_at", DateTime(timezone=True), nullable=True),

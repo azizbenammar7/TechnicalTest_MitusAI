@@ -216,6 +216,11 @@ operation and a transient cloud outage never restarts a healthy process.
 - **Emulator-validated** (opt-in via env): `PostgreSQLAnalysisRepository`
   against a PostgreSQL container; `AzureBlobObjectStorage` against Azurite,
   including a real SAS `PUT` upload followed by checksum-verified finalize.
+- **Split-plane end-to-end** (`tests/test_split_plane_e2e.py`, `make
+  p2-split-test`): the real coordinator + worker + executor + API read path
+  against PostgreSQL + Azurite + the local queue -- create/execute/succeed,
+  retry chain, queued and running cancellation, deterministic failure, and
+  duplicate-delivery idempotency.
 
 Contract suites (`tests/contracts/`) run the same behavioural tests across
 adapters:
@@ -226,19 +231,61 @@ ObjectStorage       →  InMemoryObjectStorage   +  AzureBlobObjectStorage (Azur
 JobQueue            →  LocalFilesystemQueue     +  AzureServiceBusQueue (fake broker)
 ```
 
+## Split control-plane / data-plane execution (P2.5)
+
+The coordinator, worker, executor, and API read path now depend only on the
+three ports -- `AnalysisRepository`, `ObjectStorage`, `JobQueue` -- and never on
+the fused `LocalAnalysisRunStore`. The same real execution code runs in three
+compositions, chosen at startup by the composition root:
+
+```
+Local        repository=LocalAnalysisRunStore  storage=LocalAnalysisRunStore  queue=LocalFilesystemQueue
+Split local  repository=PostgreSQLAnalysisRepo  storage=AzureBlob (Azurite)    queue=LocalFilesystemQueue
+Full Azure   repository=PostgreSQLAnalysisRepo  storage=AzureBlob              queue=AzureServiceBusQueue   (real-Azure pending)
+```
+
+Key properties, exercised by `tests/test_split_plane_e2e.py` against PostgreSQL +
+Azurite + the local queue (`make p2-split-test`):
+
+- **Input materialization** goes through `ObjectStorage.materialize_input`, which
+  downloads to a bounded worker-local workspace and removes it after the pipeline
+  returns (success, failure, or cancellation). The API never shares a filesystem
+  with the worker.
+- **Artifacts** are published through `ObjectStorage.write_artifact`; only their
+  metadata (id, category, path, media type, size, sha256, schema version) is
+  written to PostgreSQL. A terminal `succeeded`/`partial` state is gated on a
+  provider-neutral integrity re-read (`artifact_reference_integrity`).
+- **Cancellation** is authoritative control-plane state on the repository
+  (`request_cancellation` / `cancellation_requested`; a `cancel_requested` column
+  in PostgreSQL, added by migration `0002_cancellation`), never a filesystem
+  marker. The worker observes it at safe checkpoints.
+- **Idempotency**: the worker asks the repository -- not the queue -- whether a
+  run should execute, so an at-least-once redelivery of a terminal job is a no-op
+  and never creates a second attempt or duplicate artifacts.
+- **Retry** preserves the attempt chain across planes (new `run_id`, same
+  `logical_analysis_id`, `attempt_number + 1`, `previous_attempt_run_id`), with
+  the source reused via `ObjectStorage.copy_input`.
+- **Readiness** reflects the configured planes: split mode probes PostgreSQL
+  (connectivity + schema revision) and the Blob container; local mode probes
+  writable directories.
+
+The synchronous multipart ingestion path remains for local/dev compatibility;
+the direct-to-object `DirectUploadService` remains the preferred cloud ingestion
+route. Both create the immutable attempt through the repository and enqueue one
+job through the queue.
+
 ## Known limitations / what needs real Azure
 
 - **Azure Service Bus** is validated only against a fake broker. Behaviour
   against a real namespace (lock durations, DLQ, duplicate detection settings)
-  is **real-Azure pending**.
-- **Azure Blob** is validated against Azurite. User-delegation SAS via Managed
-  Identity is implemented but only exercisable against a real account
-  (**real-Azure pending**).
-- The synchronous multipart ingestion coordinator and the worker execution path
-  still run on the local manifest + local object storage. Running inference with
-  the PostgreSQL control plane + Blob data plane requires splitting the executor
-  across the two ports (it currently depends on the fused `LocalAnalysisRunStore`).
-  This is the primary remaining integration and is deferred to the next phase.
+  is **real-Azure pending**. The worker's idempotency logic is provider-neutral
+  and covered by the split-plane suite, but real redelivery semantics are not.
+- **Azure Blob** is validated against Azurite (including the new
+  `put_input_file`, `copy_input`, `has_input`, and `artifact_reference_integrity`
+  paths). User-delegation SAS via Managed Identity is implemented but only
+  exercisable against a real account (**real-Azure pending**).
+- **PostgreSQL** is validated against a container. Managed identity / Azure
+  Database for PostgreSQL connectivity is **real-Azure pending**.
 
 ## What remains for P3
 

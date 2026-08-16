@@ -51,3 +51,46 @@ def blob_capability(container_client) -> bool:
     """True when the configured private Blob container is reachable."""
     container_client.get_container_properties()
     return True
+
+
+def build_readiness_probes(settings, repository, object_storage) -> dict[str, "CapabilityProbe"]:
+    """Assemble bounded, cached readiness probes for the *configured* planes.
+
+    Readiness reflects the backends actually in use: a split deployment probes
+    PostgreSQL and the Blob container; a local deployment probes writable
+    directories. Each probe reuses the already-composed adapter's connection and
+    is cached, so a burst of ``/ready`` calls performs at most one real check per
+    interval and never an expensive write. Liveness (``/health``) is unaffected.
+    """
+    import shutil
+    from pathlib import Path
+
+    from footballai_v2.runtime_health import _writable_directory
+
+    probes: dict[str, CapabilityProbe] = {}
+
+    # Control plane.
+    if settings.database_backend == "postgres":
+        engine = getattr(repository, "_engine", None)
+        probes["database"] = CapabilityProbe(lambda: engine is not None and postgres_capability(engine))
+    else:
+        run_root = Path(settings.run_root)
+        probes["run_storage"] = CapabilityProbe(lambda: _writable_directory(run_root))
+
+    # Data plane (local artifact bytes share the run root already probed above).
+    if settings.object_storage_backend == "azure_blob":
+        client = getattr(object_storage, "_client", None)
+        probes["object_storage"] = CapabilityProbe(lambda: client is not None and blob_capability(client))
+
+    # Delivery plane.
+    if settings.queue_backend == "local":
+        queue_root = Path(settings.queue_root)
+        probes["queue"] = CapabilityProbe(lambda: _writable_directory(queue_root))
+    else:
+        # Service Bus configuration is validated at composition; a bounded live
+        # probe is deferred to real Azure validation (see docs).
+        probes["queue"] = CapabilityProbe(lambda: True)
+
+    # Multipart ingestion depends on ffprobe; the direct-upload path does not.
+    probes["video_probe"] = CapabilityProbe(lambda: shutil.which("ffprobe") is not None)
+    return probes

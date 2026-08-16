@@ -50,8 +50,16 @@ PostgreSQL container), `AzureBlobObjectStorage` with a direct-upload boundary
 (implemented; validated against a faithful fake broker — real-Azure validation
 pending). A fail-fast composition root selects backends via
 `FOOTBALLAI_{DATABASE,OBJECT_STORAGE,QUEUE}_BACKEND`; the local adapters remain
-the default and the running execution path. No Azure resources were created and
-no Azure credit consumed. See
+the default.
+
+**The real coordinator, worker, executor, and API read path now run entirely
+through the ports** (`AnalysisRepository` + `ObjectStorage` + `JobQueue`), with
+no shared filesystem between the API and the worker. The same execution code
+runs locally or split across PostgreSQL + Blob-compatible storage + queue; a
+split-plane end-to-end test drives `demo_fast`, retry, cancellation,
+deterministic failure, and duplicate-delivery idempotency against PostgreSQL +
+Azurite (`make p2-split-up && make p2-split-test`). No Azure resources were
+created and no Azure credit consumed. See
 [`docs/v2/production-cloud-adapters.md`](docs/v2/production-cloud-adapters.md)
 and run the emulator-backed suite with `make p2-db-up && make p2-test`.
 

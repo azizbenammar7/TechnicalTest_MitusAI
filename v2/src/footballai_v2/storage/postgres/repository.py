@@ -141,6 +141,39 @@ class PostgreSQLAnalysisRepository:
                 detail={"status": run.status.value, "version": stored_version + 1},
             )
 
+    # -- cancellation (control-plane intent) --------------------------------
+
+    def request_cancellation(self, run_id: str) -> None:
+        """Record cancellation intent for a non-terminal attempt.
+
+        Idempotent: a repeated request is a no-op. A terminal attempt is left
+        untouched -- its outcome is already authoritative and immutable.
+        """
+        with self._engine.begin() as connection:
+            row = connection.execute(
+                select(schema.analysis_attempts.c.status)
+                .where(schema.analysis_attempts.c.run_id == run_id)
+                .with_for_update()
+            ).first()
+            if row is None:
+                raise RunNotFoundError(run_id)
+            if AnalysisRunStatus(row[0]).is_terminal:
+                return
+            connection.execute(
+                schema.analysis_attempts.update()
+                .where(schema.analysis_attempts.c.run_id == run_id)
+                .values(cancel_requested=True)
+            )
+
+    def cancellation_requested(self, run_id: str) -> bool:
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                select(schema.analysis_attempts.c.cancel_requested).where(
+                    schema.analysis_attempts.c.run_id == run_id
+                )
+            ).first()
+        return bool(row[0]) if row is not None else False
+
     def list_runs(self) -> tuple[AnalysisRun, ...]:
         with self._engine.connect() as connection:
             rows = connection.execute(

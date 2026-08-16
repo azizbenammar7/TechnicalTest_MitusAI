@@ -18,7 +18,8 @@ from footballai_v2.api.models import (
     TimelinePoint,
 )
 from footballai_v2.contracts.v1 import AnalysisRun, DataOrigin
-from footballai_v2.storage import LocalAnalysisRunStore, ManifestConflictError, RunNotFoundError
+from footballai_v2.storage import ManifestConflictError, RunNotFoundError
+from footballai_v2.storage.ports import ObjectStorage
 
 
 class LegacyDataError(ValueError):
@@ -39,8 +40,8 @@ def _number(value: Any, default: float = 0.0) -> float:
 class LegacyRunAdapter:
     """Read integrity-checked legacy or V2 dashboard-compatible artifacts."""
 
-    def __init__(self, store: LocalAnalysisRunStore, run: AnalysisRun) -> None:
-        self.store = store
+    def __init__(self, object_storage: ObjectStorage, run: AnalysisRun) -> None:
+        self.store = object_storage
         self.run = run
         self.summary = self._json_artifact("legacy-player-summary")
         self.advisories = self._optional_json_artifact("workload-advisory") or {}
@@ -60,7 +61,10 @@ class LegacyRunAdapter:
         try:
             content = self.store.read_artifact_bytes(self.run.run_id, artifact_id)
             return json.loads(content.decode("utf-8"), parse_constant=_reject_constant)
-        except (RunNotFoundError, ManifestConflictError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        # FileNotFoundError covers the local RunNotFoundError and the object-storage
+        # ObjectNotFoundError; ValueError covers the Blob adapter's bounded-read and
+        # integrity failures. All map to the same safe, provider-neutral error.
+        except (FileNotFoundError, ManifestConflictError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise LegacyDataError(f"registered {artifact_id} artifact is unavailable or malformed") from exc
 
     def _optional_json_artifact(self, artifact_id: str) -> Any | None:

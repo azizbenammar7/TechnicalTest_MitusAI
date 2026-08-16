@@ -37,11 +37,11 @@ from footballai_v2.api.models import (
 )
 from footballai_v2.contracts.v1 import ANALYSIS_RUN_CONTRACT_VERSION, AnalysisRun, AnalysisRunStatus, InvalidStatusTransition
 from footballai_v2.execution.adapters import profile_catalog
-from footballai_v2.execution.cancellation import CancellationStore
 from footballai_v2.execution.coordinator import AnalysisCoordinator, ExecutionSettings, UploadValidationError
 from footballai_v2.execution.progress import active_stage, overall_progress
-from footballai_v2.runtime_health import checks_ready, local_dependency_checks
-from footballai_v2.storage import LocalAnalysisRunStore, ManifestConflictError, RunNotFoundError
+from footballai_v2.runtime_health import checks_ready
+from footballai_v2.runtime_readiness import build_readiness_probes
+from footballai_v2.storage import ManifestConflictError, RunNotFoundError
 
 
 logger = logging.getLogger("footballai_v2.api")
@@ -119,14 +119,21 @@ def create_app(
     """Create a local, read-oriented API bound to one configured run root."""
     execution_settings = settings or ExecutionSettings.from_environment(run_root, queue_root)
     coordinator = AnalysisCoordinator(execution_settings)
-    store = coordinator.store
-    cancellations = CancellationStore(store.root)
+    # The API depends only on the ports. It never assumes it shares a filesystem
+    # with the worker: lifecycle comes from the repository, artifact bytes from
+    # object storage. In local mode both resolve to the fused store; in split mode
+    # they are PostgreSQL and Blob respectively.
+    repository = coordinator.repository
+    object_storage = coordinator.object_storage
+    # Bounded, cached readiness probes for the configured planes (built once).
+    readiness_probes = build_readiness_probes(execution_settings, repository, object_storage)
     app = FastAPI(
         title="FootballAi V2 local analysis API",
         version="1.0.0",
         description="Local upload, execution-control, and results API for versioned FootballAi analysis runs.",
     )
-    app.state.run_store = store
+    app.state.run_store = repository
+    app.state.object_storage = object_storage
     origins = _validate_origins(allowed_origins, execution_settings.environment)
     app.add_middleware(
         CORSMiddleware,
@@ -156,13 +163,13 @@ def create_app(
 
     def load_run(run_id: UUID4) -> AnalysisRun:
         try:
-            return store.load(str(run_id))
+            return repository.load(str(run_id))
         except RunNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Analysis run not found") from exc
 
     def adapter(run: AnalysisRun) -> LegacyRunAdapter:
         try:
-            return LegacyRunAdapter(store, run)
+            return LegacyRunAdapter(object_storage, run)
         except LegacyDataError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -176,7 +183,7 @@ def create_app(
 
     @app.get("/api/ready", response_model=ReadinessResponse)
     def readiness(response: Response) -> ReadinessResponse:
-        checks = local_dependency_checks(execution_settings.run_root, execution_settings.queue_root)
+        checks = {name: probe.status() for name, probe in readiness_probes.items()}
         ready = checks_ready(checks)
         if not ready:
             response.status_code = 503
@@ -222,7 +229,7 @@ def create_app(
     @app.get("/api/v1/runs", response_model=RunListResponse)
     def list_runs() -> RunListResponse:
         items = []
-        for run in store.list_runs():
+        for run in repository.list_runs():
             progress = (
                 sum(float(stage.progress_percent) for stage in run.stages) / len(run.stages)
                 if run.stages
@@ -256,7 +263,7 @@ def create_app(
             for item in sorted(
                 (
                     item
-                    for item in store.list_runs()
+                    for item in repository.list_runs()
                     if item.logical_analysis_id == run.logical_analysis_id
                 ),
                 key=lambda item: item.attempt_number,
@@ -296,11 +303,7 @@ def create_app(
     def progress(run_id: UUID4) -> ProgressResponse:
         run = load_run(run_id)
         updated = run.completed_at or next((stage.finished_at or stage.started_at for stage in reversed(run.stages) if stage.finished_at or stage.started_at), None) or run.created_at
-        can_clone = False
-        try:
-            store.input_path(run.run_id); can_clone = True
-        except (ManifestConflictError, RunNotFoundError):
-            pass
+        can_clone = object_storage.has_input(run.run_id)
         return ProgressResponse(
             run_id=run.run_id, logical_analysis_id=run.logical_analysis_id, attempt_number=run.attempt_number,
             status=run.status.value, overall_progress_percent=overall_progress(run), active_stage=active_stage(run),
@@ -317,9 +320,9 @@ def create_app(
             raise HTTPException(status_code=409, detail="Terminal analysis attempts cannot be cancelled")
         if run.status is AnalysisRunStatus.QUEUED:
             coordinator.queue.cancel(run.run_id)
-            store.save(run.cancel(reason="Cancelled before execution."))
+            repository.save(run.cancel(reason="Cancelled before execution."))
             return OperationResponse(run_id=run.run_id, status="cancelled", message="Queued analysis cancelled.")
-        cancellations.request(run.run_id)
+        repository.request_cancellation(run.run_id)
         return OperationResponse(run_id=run.run_id, status="running", message="Cancellation requested; the worker will stop at a safe checkpoint.")
 
     @app.post("/api/v1/runs/{run_id}/retry", response_model=QueuedRunResponse, status_code=202, summary="Create a new retry attempt")
@@ -360,7 +363,7 @@ def create_app(
                     sha256=item.sha256,
                     schema_version=item.schema_version,
                     integrity_state=(
-                        "verified" if store.artifact_integrity(run.run_id, item.artifact_id) else "invalid"
+                        "verified" if object_storage.artifact_integrity(run.run_id, item.artifact_id) else "invalid"
                     ),
                 )
                 for item in run.artifacts

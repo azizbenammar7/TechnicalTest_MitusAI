@@ -8,11 +8,10 @@ import signal
 import socket
 import time
 
+from footballai_v2 import composition
 from footballai_v2.execution.coordinator import ExecutionSettings
 from footballai_v2.execution.executor import AnalysisExecutor
-from footballai_v2.execution.queue import create_job_queue
 from footballai_v2.logging_config import configure_logging
-from footballai_v2.storage import LocalAnalysisRunStore
 
 
 def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -28,8 +27,12 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
 def main() -> None:
     configure_logging("footballai-worker")
     settings = ExecutionSettings.from_environment()
-    store = LocalAnalysisRunStore(settings.run_root)
-    queue = create_job_queue(settings.queue_backend, settings.queue_root)
+    # The worker is built from configured provider-neutral planes; it never
+    # assumes a shared filesystem with the API. Local, split (PostgreSQL + Blob +
+    # local queue), and full Azure all resolve through the same composition root.
+    repository = composition.create_analysis_repository(settings)
+    object_storage = composition.create_object_storage(settings)
+    queue = composition.create_job_queue(settings, repository=repository)
     configured_worker_id = os.getenv("FOOTBALLAI_WORKER_ID", "").strip()
     worker_id = (configured_worker_id or f"{socket.gethostname()}-{os.getpid()}")[:128]
     poll = _bounded_float("FOOTBALLAI_WORKER_POLL_SECONDS", .25, .05, 60)
@@ -39,8 +42,8 @@ def main() -> None:
     def stop(_signum, _frame):
         nonlocal stopped; stopped = True
     signal.signal(signal.SIGINT, stop); signal.signal(signal.SIGTERM, stop)
-    queue.recover_abandoned(claim_timeout, store)
-    executor = AnalysisExecutor(store, stage_delay_seconds=delay)
+    queue.recover_abandoned(claim_timeout, repository)
+    executor = AnalysisExecutor(repository, object_storage, stage_delay_seconds=delay)
     worker_logger = logging.getLogger("footballai_v2.worker")
     worker_logger.info(
         "worker_started worker_id=%s queue_backend=%s object_storage_backend=%s database_backend=%s",

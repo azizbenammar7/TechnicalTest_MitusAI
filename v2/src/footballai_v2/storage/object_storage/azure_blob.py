@@ -132,6 +132,19 @@ class AzureBlobObjectStorage:
             return False
         return True
 
+    def artifact_reference_integrity(self, run_id: str, reference: ArtifactReference) -> bool:
+        try:
+            key, metadata = self._resolve_artifact(run_id, reference.artifact_id)
+        except ObjectNotFoundError:
+            return False
+        if int(metadata["size_bytes"]) != reference.size_bytes:
+            return False
+        content = self._client.get_blob_client(key).download_blob().readall()
+        return (
+            len(content) == reference.size_bytes
+            and hashlib.sha256(content).hexdigest() == reference.sha256
+        )
+
     def _resolve_artifact(self, run_id: str, artifact_id: str) -> tuple[str, dict[str, str]]:
         prefix = f"{run_prefix(run_id)}artifacts/"
         for blob in self._client.list_blobs(name_starts_with=prefix, include=["metadata"]):
@@ -153,6 +166,64 @@ class AzureBlobObjectStorage:
             metadata={"sha256": digest, "size_bytes": str(len(content))},
         )
         return key
+
+    def put_input_file(
+        self, run_id: str, source_path: str | Path, *, extension: str, content_type: str
+    ) -> str:
+        """Stream a validated local file to blob as this run's single input.
+
+        Streams from disk so a large upload never has to be fully resident in
+        memory. The caller retains ownership of ``source_path``.
+        """
+        key = input_object_key(run_id, extension)
+        digest = hashlib.sha256()
+        size = 0
+        with Path(source_path).open("rb") as reader:
+            for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+            reader.seek(0)
+            self._client.get_blob_client(key).upload_blob(
+                reader,
+                overwrite=False,
+                content_settings=ContentSettings(content_type=content_type),
+                metadata={"sha256": digest.hexdigest(), "size_bytes": str(size)},
+            )
+        return key
+
+    def copy_input(self, source_run_id: str, destination_run_id: str) -> None:
+        """Copy one run's single input object to another run, verifying integrity.
+
+        Streams via a bounded worker-local temporary file so a large input never
+        has to be fully resident in memory, then re-ingests through
+        ``put_input_file`` (which recomputes the checksum on the way up).
+        """
+        source_key = self._single_input_key(source_run_id)
+        source_blob = self._client.get_blob_client(source_key)
+        properties = source_blob.get_blob_properties()
+        extension = Path(source_key).suffix
+        content_type = (properties.content_settings.content_type or "application/octet-stream")
+        expected = (properties.metadata or {}).get("sha256")
+        directory = Path(tempfile.mkdtemp(prefix="footballai-copy-"))
+        target = directory / f"source{extension}"
+        try:
+            with target.open("wb") as handle:
+                source_blob.download_blob().readinto(handle)
+            if expected is not None and hashlib.sha256(target.read_bytes()).hexdigest() != expected:
+                raise ValueError("source input integrity check failed")
+            self.put_input_file(
+                destination_run_id, target, extension=extension, content_type=content_type
+            )
+        finally:
+            target.unlink(missing_ok=True)
+            directory.rmdir()
+
+    def has_input(self, run_id: str) -> bool:
+        try:
+            self._single_input_key(run_id)
+        except ObjectNotFoundError:
+            return False
+        return True
 
     @contextmanager
     def materialize_input(self, run_id: str) -> Iterator[Path]:

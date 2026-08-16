@@ -1,4 +1,4 @@
-.PHONY: v2-demo v2-test v2-v1-compat-setup v2-v1-compat-readiness v2-v1-compat-smoke v2-demo-v1-compat p1-build p1-up p1-down p1-logs p2-db-up p2-db-down p2-db-migrate p2-test
+.PHONY: v2-demo v2-test v2-v1-compat-setup v2-v1-compat-readiness v2-v1-compat-smoke v2-demo-v1-compat p1-build p1-up p1-down p1-logs p2-db-up p2-db-down p2-db-migrate p2-test p2-split-up p2-split-migrate p2-split-test p2-split-down
 
 # P2 cloud-adapter local testing. The URLs/keys below are development-only and
 # match compose.p2.yaml; the Azurite key is Microsoft's public well-known
@@ -50,3 +50,20 @@ p2-test: p2-db-migrate
 	FOOTBALLAI_TEST_DATABASE_URL="$(P2_DATABASE_URL)" \
 	FOOTBALLAI_TEST_BLOB_CONNECTION_STRING="$(P2_BLOB_CONNECTION_STRING)" \
 	PYTHONPATH=v2/src $(P2_PYTHON) -m pytest v2/tests -q -ra
+
+# LOCAL SPLIT-PLANE VALIDATION -- PostgreSQL + Azurite + LocalFilesystemQueue.
+# This is NOT Azure staging and provisions no real cloud resource; it runs the
+# real coordinator/worker/executor against emulated control and data planes so
+# the application is exercised without any shared API/worker filesystem state.
+p2-split-up:
+	docker compose -f compose.p2.yaml up --detach
+
+p2-split-migrate: p2-db-migrate
+
+p2-split-test: p2-split-migrate
+	FOOTBALLAI_TEST_DATABASE_URL="$(P2_DATABASE_URL)" \
+	FOOTBALLAI_TEST_BLOB_CONNECTION_STRING="$(P2_BLOB_CONNECTION_STRING)" \
+	PYTHONPATH=v2/src $(P2_PYTHON) -m pytest v2/tests/test_split_plane_e2e.py -q -ra
+
+p2-split-down:
+	docker compose -f compose.p2.yaml down --volumes

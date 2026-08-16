@@ -112,6 +112,16 @@ class InMemoryObjectStorage:
             return False
         return True
 
+    def artifact_reference_integrity(self, run_id: str, reference: ArtifactReference) -> bool:
+        try:
+            _key, stored = self._resolve_artifact(run_id, reference.artifact_id)
+        except ObjectNotFoundError:
+            return False
+        return (
+            len(stored.data) == reference.size_bytes
+            and hashlib.sha256(stored.data).hexdigest() == reference.sha256
+        )
+
     def _resolve_artifact(self, run_id: str, artifact_id: str) -> tuple[str, _StoredObject]:
         from footballai_v2.storage.object_storage.keys import run_prefix
 
@@ -132,6 +142,37 @@ class InMemoryObjectStorage:
             content_type,
         )
         return key
+
+    def put_input_file(
+        self, run_id: str, source_path: str | Path, *, extension: str, content_type: str
+    ) -> str:
+        """Ingest a validated local file as this run's single input.
+
+        The caller retains ownership of ``source_path``.
+        """
+        return self.put_input(
+            run_id,
+            Path(source_path).read_bytes(),
+            extension=extension,
+            content_type=content_type,
+        )
+
+    def copy_input(self, source_run_id: str, destination_run_id: str) -> None:
+        key, stored = self._input_object(source_run_id)
+        extension = Path(key).suffix
+        self.put_input(
+            destination_run_id,
+            stored.data,
+            extension=extension,
+            content_type=stored.content_type,
+        )
+
+    def has_input(self, run_id: str) -> bool:
+        try:
+            self._input_object(run_id)
+        except ObjectNotFoundError:
+            return False
+        return True
 
     @contextmanager
     def materialize_input(self, run_id: str) -> Iterator[Path]:
