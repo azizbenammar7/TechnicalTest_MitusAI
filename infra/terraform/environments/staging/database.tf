@@ -11,6 +11,7 @@ resource "azurerm_postgresql_flexible_server" "staging" {
   delegated_subnet_id           = azurerm_subnet.postgres.id
   private_dns_zone_id           = azurerm_private_dns_zone.postgres.id
   public_network_access_enabled = false
+  zone                          = "1"
   administrator_login           = "footballai_admin"
   administrator_password        = random_password.postgres_admin.result
   sku_name                      = var.postgres_sku_name

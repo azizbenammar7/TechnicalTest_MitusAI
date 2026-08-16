@@ -1,7 +1,8 @@
 # Azure staging architecture
 
-Status: provider registration and remote-state bootstrap complete; the
-**FootballAI staging foundation is not deployed**.
+Status: remote-state bootstrap and the controlled P3.2 foundation apply are
+complete. The **FootballAI staging foundation is deployed with no application
+workloads**.
 
 ## Verified subscription discovery
 
@@ -28,11 +29,19 @@ foundation services. France Central PostgreSQL discovery exposed the Burstable
 remain reasonable fallback regions. VM-usage discovery returned no allocations;
 GPU availability was not demonstrated and is not a dependency.
 
+On 2026-08-16, P3.2 applied the reviewed foundation plan: 27 resources added,
+zero changed and zero destroyed, with `deploy_workloads = false`. Independent
+Azure CLI checks validated the private PostgreSQL server and database, private
+Blob container, Service Bus queue, ACR, identities and scoped RBAC, VNet/private
+DNS, Log Analytics workspace, and Container Apps environment. A follow-up plan
+reported no changes after explicitly recording Azure's selected PostgreSQL zone,
+PostgreSQL subnet Storage endpoint, and Consumption workload profile.
+
 Azure for Students has finite credit and can disable services when credit is
 exhausted. Exact credit balance and service-specific Container Apps quotas were
 not exposed by the read-only CLI calls. Container Apps environment usage can be
-checked only after an environment exists. Quota availability therefore remains
-a foundation-apply gate.
+checked only after an environment exists. Application workload quota remains a
+P4 deployment gate.
 
 ## Selected topology
 

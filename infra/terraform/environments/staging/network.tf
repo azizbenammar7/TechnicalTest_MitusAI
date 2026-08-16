@@ -26,6 +26,7 @@ resource "azurerm_subnet" "postgres" {
   resource_group_name  = azurerm_resource_group.staging.name
   virtual_network_name = azurerm_virtual_network.staging.name
   address_prefixes     = ["10.42.2.0/24"]
+  service_endpoints    = ["Microsoft.Storage"]
 
   delegation {
     name = "postgres-flexible-server"

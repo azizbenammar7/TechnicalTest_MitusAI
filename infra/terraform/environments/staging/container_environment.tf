@@ -6,5 +6,13 @@ resource "azurerm_container_app_environment" "staging" {
   infrastructure_subnet_id       = azurerm_subnet.container_apps.id
   internal_load_balancer_enabled = false
   zone_redundancy_enabled        = false
-  tags                           = var.tags
+
+  workload_profile {
+    name                  = "Consumption"
+    workload_profile_type = "Consumption"
+    minimum_count         = 0
+    maximum_count         = 0
+  }
+
+  tags = var.tags
 }
