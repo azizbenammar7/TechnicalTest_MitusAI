@@ -4,3 +4,4 @@ SQLAlchemy==2.0.52
 psycopg==3.3.4
 alembic==1.19.1
 Mako==1.4.1
+MarkupSafe==3.0.3

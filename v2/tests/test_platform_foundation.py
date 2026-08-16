@@ -88,3 +88,10 @@ def test_production_requirement_files_are_fully_pinned():
     for filename in ("requirements-api.txt", "requirements-worker-core.txt"):
         requirements = (repository / "v2" / filename).read_text(encoding="utf-8").splitlines()
         assert all("==" in line for line in requirements if line and not line.startswith("#"))
+
+
+def test_api_migration_runtime_pins_mako_template_dependency():
+    repository = Path(__file__).resolve().parents[2]
+    requirements = (repository / "v2" / "requirements-postgres.txt").read_text(encoding="utf-8")
+    assert "Mako==" in requirements
+    assert "MarkupSafe==" in requirements
