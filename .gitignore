@@ -50,6 +50,8 @@ __pycache__/
 *.py[cod]
 *.pyo
 .env
+.env.*
+!.env.example
 .venv*
 venv/
 env/
@@ -58,6 +60,10 @@ env/
 .coverage
 coverage.xml
 htmlcov/
+
+# Container-local runtime overrides
+compose.override.yaml
+docker-compose.override.yml
 
 # ─────────────────────────────────────────────────────────────
 # Editor / OS / tooling

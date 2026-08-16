@@ -17,6 +17,13 @@ class HealthResponse(PublicModel):
     contract_version: str
 
 
+class ReadinessResponse(PublicModel):
+    status: str
+    service: str
+    environment: str
+    checks: dict[str, str]
+
+
 class PipelineProfile(PublicModel):
     profile_id: str
     display_name: str

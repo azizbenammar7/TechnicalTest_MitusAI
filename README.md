@@ -37,6 +37,13 @@ See [`docs/v2/V1_COMPAT_SETUP.md`](docs/v2/V1_COMPAT_SETUP.md). `v1_compat`
 is a preserved-algorithm compatibility profile. It is not the future
 detector-neutral V2 production engine.
 
+Production Platform status: **P1 containerized service boundaries are
+implemented and locally validated** for the compiled React frontend, FastAPI
+API, and long-lived worker. The stack currently retains the local filesystem
+queue and run store while P2 provider adapters are prepared. Start it with
+`make p1-build && make p1-up`; see
+[`docs/v2/production-containerization.md`](docs/v2/production-containerization.md).
+
 The remaining README is the preserved V1 technical-test documentation.
 
 End-to-end pipeline: detect & track players in a full 90-minute match →

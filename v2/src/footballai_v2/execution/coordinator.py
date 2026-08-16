@@ -17,7 +17,7 @@ from footballai_v2.contracts.v1 import (
 from footballai_v2.execution.adapters import profile_catalog
 from footballai_v2.execution.adapters.v1_compat_runtime import check_v1_compat_readiness
 from footballai_v2.execution.contracts import ExecutionJob
-from footballai_v2.execution.queue import LocalFilesystemQueue
+from footballai_v2.execution.queue import create_job_queue
 from footballai_v2.storage import LocalAnalysisRunStore, ManifestConflictError
 
 
@@ -39,6 +39,28 @@ class ExecutionSettings:
     allowed_extensions: tuple[str, ...] = (".mp4", ".mov", ".mkv", ".webm")
     ffprobe_timeout_seconds: float = 10
     allow_test_profiles: bool = False
+    environment: str = "local"
+    queue_backend: str = "local"
+    object_storage_backend: str = "local"
+    database_backend: str = "local_manifest"
+
+    def __post_init__(self) -> None:
+        if self.environment not in {"local", "staging", "production", "test"}:
+            raise ValueError("FOOTBALLAI_ENVIRONMENT must be local, staging, production, or test")
+        implemented = {
+            "queue": (self.queue_backend, "local"),
+            "object storage": (self.object_storage_backend, "local"),
+            "database": (self.database_backend, "local_manifest"),
+        }
+        for label, (configured, supported) in implemented.items():
+            if configured != supported:
+                raise ValueError(
+                    f"The configured {label} backend {configured!r} is not implemented; expected {supported!r}"
+                )
+        if self.max_upload_bytes < 1:
+            raise ValueError("FOOTBALLAI_MAX_UPLOAD_BYTES must be positive")
+        if self.max_video_duration_seconds <= 0:
+            raise ValueError("FOOTBALLAI_MAX_VIDEO_DURATION_SECONDS must be positive")
 
     @classmethod
     def from_environment(cls, run_root: str | Path | None = None, queue_root: str | Path | None = None) -> "ExecutionSettings":
@@ -47,13 +69,17 @@ class ExecutionSettings:
             for item in os.getenv("FOOTBALLAI_ALLOWED_VIDEO_EXTENSIONS", ".mp4,.mov,.mkv,.webm").split(",") if item.strip()
         )
         return cls(
-            Path(run_root or os.getenv("FOOTBALLAI_V2_RUN_ROOT", "data/runs")),
-            Path(queue_root or os.getenv("FOOTBALLAI_V2_QUEUE_ROOT", "data/job-queue")),
-            int(os.getenv("FOOTBALLAI_MAX_UPLOAD_BYTES", str(250 * 1024 * 1024))),
-            float(os.getenv("FOOTBALLAI_MAX_VIDEO_DURATION_SECONDS", str(4 * 60 * 60))),
-            extensions,
-            float(os.getenv("FFPROBE_TIMEOUT_SECONDS", "10")),
-            os.getenv("FOOTBALLAI_ENABLE_TEST_PROFILES", "0") == "1",
+            run_root=Path(run_root or os.getenv("FOOTBALLAI_V2_RUN_ROOT", "data/runs")),
+            queue_root=Path(queue_root or os.getenv("FOOTBALLAI_V2_QUEUE_ROOT", "data/job-queue")),
+            max_upload_bytes=int(os.getenv("FOOTBALLAI_MAX_UPLOAD_BYTES", str(250 * 1024 * 1024))),
+            max_video_duration_seconds=float(os.getenv("FOOTBALLAI_MAX_VIDEO_DURATION_SECONDS", str(4 * 60 * 60))),
+            allowed_extensions=extensions,
+            ffprobe_timeout_seconds=float(os.getenv("FFPROBE_TIMEOUT_SECONDS", "10")),
+            allow_test_profiles=os.getenv("FOOTBALLAI_ENABLE_TEST_PROFILES", "0") == "1",
+            environment=os.getenv("FOOTBALLAI_ENVIRONMENT", "local").strip().lower(),
+            queue_backend=os.getenv("FOOTBALLAI_QUEUE_BACKEND", "local").strip().lower(),
+            object_storage_backend=os.getenv("FOOTBALLAI_OBJECT_STORAGE_BACKEND", "local").strip().lower(),
+            database_backend=os.getenv("FOOTBALLAI_DATABASE_BACKEND", "local_manifest").strip().lower(),
         )
 
 
@@ -61,7 +87,7 @@ class AnalysisCoordinator:
     def __init__(self, settings: ExecutionSettings) -> None:
         self.settings = settings
         self.store = LocalAnalysisRunStore(settings.run_root)
-        self.queue = LocalFilesystemQueue(settings.queue_root)
+        self.queue = create_job_queue(settings.queue_backend, settings.queue_root)
         self.upload_root = self.store.root / ".uploads"
         self.upload_root.mkdir(exist_ok=True)
 

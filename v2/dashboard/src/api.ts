@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react'
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+declare global {
+  interface Window {
+    __FOOTBALLAI_CONFIG__?: { apiBase?: string | null }
+  }
+}
+
+const API_BASE = window.__FOOTBALLAI_CONFIG__?.apiBase ?? import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
 
 export class ApiError extends Error {
   constructor(message: string, public status?: number) {

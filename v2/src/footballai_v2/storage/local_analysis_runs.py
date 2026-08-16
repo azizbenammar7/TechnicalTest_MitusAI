@@ -6,8 +6,9 @@ import hashlib
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 from footballai_v2.contracts.v1 import (
     AnalysisRun,
@@ -148,6 +149,11 @@ class LocalAnalysisRunStore:
             raise ManifestConflictError("run must contain exactly one safe input file")
         self._require_within_run(candidates[0].resolve(), run_dir)
         return candidates[0]
+
+    @contextmanager
+    def materialize_input(self, run_id: str) -> Iterator[Path]:
+        """Yield a local input path; cloud adapters may download to bounded temporary storage."""
+        yield self.input_path(run_id)
 
     def create_retry_attempt(
         self,

@@ -19,7 +19,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[5]
+REPOSITORY_ROOT = Path(
+    os.getenv("FOOTBALLAI_APPLICATION_ROOT", str(Path(__file__).resolve().parents[5]))
+).expanduser().resolve()
 DEFAULT_MODEL_PATH = REPOSITORY_ROOT / ".models" / "yolov8m.pt"
 MODEL_NAME = "yolov8m.pt"
 SETUP_COMMAND = "make v2-v1-compat-setup"

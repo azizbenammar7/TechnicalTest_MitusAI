@@ -101,7 +101,7 @@ class AnalysisExecutor:
                     stages[active_index] = replace(stage, status=StageStatus.FAILED, finished_at=utc_now(), error=error, message=message)
             failure = StructuredError(code, message, True, utc_now(), {"stage": stages[active_index].stage_name.value if active_index >= 0 else "ingestion"})
             self.store.save(current.fail(failure, stages=stages))
-            logger.exception("job_failed job_id=%s run_id=%s logical_analysis_id=%s attempt_number=%s worker_id=%s stage=%s status=failed duration_seconds=%.3f frames_processed=0 processing_fps=0 input_count=1 output_count=0 error_code=%s", job.job_id, job.run_id, job.logical_analysis_id, job.attempt_number, worker_id, stages[active_index].stage_name.value if active_index >= 0 else "ingestion", time.perf_counter() - started, code)
+            logger.error("job_failed job_id=%s run_id=%s logical_analysis_id=%s attempt_number=%s worker_id=%s stage=%s status=failed duration_seconds=%.3f frames_processed=0 processing_fps=0 input_count=1 output_count=0 error_code=%s", job.job_id, job.run_id, job.logical_analysis_id, job.attempt_number, worker_id, stages[active_index].stage_name.value if active_index >= 0 else "ingestion", time.perf_counter() - started, code)
             return AnalysisRunStatus.FAILED
 
     def _checkpoint(self, run_id: str) -> None:

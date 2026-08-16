@@ -6,6 +6,10 @@ import os
 from pathlib import Path
 
 from footballai_v2.api import create_app
+from footballai_v2.logging_config import configure_logging
+
+
+configure_logging("footballai-api")
 
 
 run_root = Path(os.environ.get("FOOTBALLAI_V2_RUN_ROOT", "data/runs"))

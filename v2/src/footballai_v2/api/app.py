@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import UUID4
 
@@ -31,6 +31,7 @@ from footballai_v2.api.models import (
     RunListResponse,
     ProgressResponse,
     QueuedRunResponse,
+    ReadinessResponse,
     StageView,
     TeamSummaryResponse,
 )
@@ -39,6 +40,7 @@ from footballai_v2.execution.adapters import profile_catalog
 from footballai_v2.execution.cancellation import CancellationStore
 from footballai_v2.execution.coordinator import AnalysisCoordinator, ExecutionSettings, UploadValidationError
 from footballai_v2.execution.progress import active_stage, overall_progress
+from footballai_v2.runtime_health import checks_ready, local_dependency_checks
 from footballai_v2.storage import LocalAnalysisRunStore, ManifestConflictError, RunNotFoundError
 
 
@@ -86,18 +88,23 @@ def _public_manifest(run: AnalysisRun) -> dict[str, Any]:
     return payload
 
 
-def _validate_local_origins(origins: Sequence[str]) -> list[str]:
+def _validate_origins(origins: Sequence[str], environment: str) -> list[str]:
     validated = []
     for origin in origins:
         parsed = urlparse(origin)
+        local_origin = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
+        remote_origin = environment in {"staging", "production"} and parsed.scheme == "https"
         if (
-            parsed.scheme != "http"
-            or parsed.hostname not in {"localhost", "127.0.0.1"}
+            not (local_origin or remote_origin)
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
         ):
-            raise ValueError(f"CORS origin must be an HTTP localhost origin: {origin!r}")
+            raise ValueError(
+                f"CORS origin must be HTTP localhost for local use or HTTPS in staging/production: {origin!r}"
+            )
         validated.append(origin.rstrip("/"))
     return validated
 
@@ -120,7 +127,7 @@ def create_app(
         description="Local upload, execution-control, and results API for versioned FootballAi analysis runs.",
     )
     app.state.run_store = store
-    origins = _validate_local_origins(allowed_origins)
+    origins = _validate_origins(allowed_origins, execution_settings.environment)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
@@ -163,8 +170,21 @@ def create_app(
     def health() -> HealthResponse:
         return HealthResponse(
             status="ok",
-            service="footballai-v2-local-api",
+            service="footballai-api",
             contract_version=ANALYSIS_RUN_CONTRACT_VERSION,
+        )
+
+    @app.get("/api/ready", response_model=ReadinessResponse)
+    def readiness(response: Response) -> ReadinessResponse:
+        checks = local_dependency_checks(execution_settings.run_root, execution_settings.queue_root)
+        ready = checks_ready(checks)
+        if not ready:
+            response.status_code = 503
+        return ReadinessResponse(
+            status="ready" if ready else "not_ready",
+            service="footballai-api",
+            environment=execution_settings.environment,
+            checks=checks,
         )
 
     @app.get("/api/v1/pipeline-profiles", response_model=PipelineProfileListResponse, summary="List local execution profiles")

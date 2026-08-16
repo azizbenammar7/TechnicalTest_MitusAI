@@ -5,6 +5,9 @@ preserved V1 technical-test implementation. V2 does not import from
 or write into `../pipeline/`, `../dashboard/`, `../scripts/`, or
 `../data/processed/`.
 
+The production-like container boundary and cloud-neutral P2 preparation are
+documented in [`../docs/v2/production-containerization.md`](../docs/v2/production-containerization.md).
+
 ## Analysis-run contract
 
 The first published analysis-run contract is:
