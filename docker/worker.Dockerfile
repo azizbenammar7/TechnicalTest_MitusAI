@@ -9,6 +9,11 @@ COPY v2/requirements-worker-core.txt ./requirements-worker-core.txt
 COPY v2/requirements-v1-compat.txt ./requirements-v1-compat.txt
 COPY v2/requirements-postgres.txt ./requirements-postgres.txt
 COPY v2/requirements-azure.txt ./requirements-azure.txt
+# Toolchain + libpq headers so the psycopg-c wheel can compile against libpq.
+# Confined to the build stage; the runtime image only carries libpq5 itself.
+RUN apt-get update \
+ && apt-get install --yes --no-install-recommends gcc libpq-dev python3-dev \
+ && rm -rf /var/lib/apt/lists/*
 RUN sed '/^torch==/d; /^torchvision==/d' requirements-v1-compat.txt > requirements-worker-v1.txt \
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
       -r requirements-worker-core.txt -r requirements-postgres.txt -r requirements-azure.txt \
@@ -34,7 +39,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH=/opt/venv/bin:$PATH
 
 RUN apt-get update \
- && apt-get install --yes --no-install-recommends ffmpeg libgomp1 \
+ && apt-get install --yes --no-install-recommends ffmpeg libgomp1 libpq5 \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 footballai \
  && useradd --system --uid 10001 --gid footballai --home-dir /nonexistent --shell /usr/sbin/nologin footballai \
