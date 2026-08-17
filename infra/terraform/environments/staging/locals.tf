@@ -16,7 +16,10 @@ locals {
   frontend_fqdn       = "${local.frontend_app_name}.${azurerm_container_app_environment.staging.default_domain}"
   frontend_origin     = "https://${local.frontend_fqdn}"
   api_app_name        = "ca-${local.name_prefix}-api"
-  api_fqdn            = "${local.api_app_name}.${azurerm_container_app_environment.staging.default_domain}"
-  api_origin          = "https://${local.api_fqdn}"
-  blob_origin         = trimsuffix(azurerm_storage_account.staging.primary_blob_endpoint, "/")
+  # The API uses internal-only ingress, whose FQDN carries the `.internal.`
+  # segment. The frontend proxies /api to this origin from inside the
+  # environment, so it must target the internal name, not the external form.
+  api_fqdn    = "${local.api_app_name}.internal.${azurerm_container_app_environment.staging.default_domain}"
+  api_origin  = "https://${local.api_fqdn}"
+  blob_origin = trimsuffix(azurerm_storage_account.staging.primary_blob_endpoint, "/")
 }
