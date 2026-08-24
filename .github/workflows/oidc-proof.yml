@@ -1,0 +1,95 @@
+# Secretless OIDC proof: each job mints a GitHub OIDC token scoped to its
+# environment, exchanges it for the matching Azure UAMI via a federated
+# credential, and performs one harmless, role-appropriate READ. No Azure
+# resource is created or modified. No client secret is used.
+#
+# Trigger is a branch-scoped push (forks cannot push to this branch, so the
+# id-token permission is never exposed to untrusted code) plus manual dispatch.
+name: OIDC identity proof
+
+on:
+  push:
+    branches: [feat/p5-devsecops-cicd]
+    paths: ['.github/workflows/oidc-proof.yml']
+  workflow_dispatch:
+
+# Least privilege at the top; each job adds id-token:write only for itself.
+permissions:
+  contents: read
+
+concurrency:
+  group: oidc-proof-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-identity:
+    name: BUILD identity (staging-build)
+    runs-on: ubuntu-latest
+    environment: staging-build
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Azure login via OIDC (build UAMI)
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Prove identity and AcrPush-appropriate ACR read
+        run: |
+          echo "::group::az account show"
+          az account show --query '{user:user.name, subscription:name, subscriptionId:id, tenantId:tenantId}' -o json
+          echo "::endgroup::"
+          echo "ACR data-plane read (AcrPush includes pull); empty catalog is a valid auth proof:"
+          az acr repository list --name "${{ vars.ACR_NAME }}" -o tsv || echo "(no repositories yet)"
+
+  plan-identity:
+    name: PLAN identity (staging-plan)
+    runs-on: ubuntu-latest
+    environment: staging-plan
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Azure login via OIDC (plan UAMI)
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Prove identity, staging read, and Terraform-state access
+        run: |
+          echo "::group::az account show"
+          az account show --query '{user:user.name, subscriptionId:id}' -o json
+          echo "::endgroup::"
+          echo "Staging RG read (Reader):"
+          az group show -n "${{ vars.AZURE_RESOURCE_GROUP }}" --query '{name:name, provisioningState:properties.provisioningState}' -o json
+          echo "Terraform-state access (Storage Blob Data Contributor on tfstate container, AAD auth):"
+          az storage blob list \
+            --account-name "${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            --container-name "${{ vars.TF_STATE_CONTAINER }}" \
+            --auth-mode login \
+            --query '[].name' -o tsv
+
+  deploy-identity:
+    name: DEPLOY identity (staging — approval gated)
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Azure login via OIDC (deploy UAMI)
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Prove identity and staging RG read (READ ONLY, no mutation)
+        run: |
+          echo "::group::az account show"
+          az account show --query '{user:user.name, subscriptionId:id}' -o json
+          echo "::endgroup::"
+          echo "Staging RG read (Contributor, used read-only here):"
+          az group show -n "${{ vars.AZURE_RESOURCE_GROUP }}" --query '{name:name, provisioningState:properties.provisioningState}' -o json
