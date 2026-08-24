@@ -8,7 +8,7 @@ h11==0.16.0
 idna==3.18
 pydantic==2.13.4
 pydantic-core==2.46.4
-python-multipart==0.0.22
+python-multipart==0.0.31
 starlette==1.6.0
 typing-extensions==4.16.0
 typing-inspection==0.4.4
