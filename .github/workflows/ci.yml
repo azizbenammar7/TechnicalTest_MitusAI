@@ -39,6 +39,8 @@ jobs:
             -r requirements-test.txt \
             -r v2/requirements-postgres.txt \
             -r v2/requirements-azure.txt
+      - name: Install ffmpeg (ffprobe drives the video_probe readiness check)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Validate Python syntax
         run: python -m compileall -q v2/src v2/tests tests pipeline scripts dashboard
       - name: Reject tracked model weights and uploaded videos
@@ -63,25 +65,36 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U footballai"
           --health-interval 5s --health-timeout 5s --health-retries 15
-      azurite:
-        image: mcr.microsoft.com/azure-storage/azurite:3.33.0
-        ports: ["10000:10000"]
     env:
       FOOTBALLAI_TEST_DATABASE_URL: postgresql+psycopg://footballai:devonly_ci@localhost:5432/footballai_ci
       # Microsoft's public well-known Azurite emulator account key — NOT a secret
-      # (allowlisted in .gitleaks.toml). Points at the azurite service container.
+      # (allowlisted in .gitleaks.toml).
       FOOTBALLAI_TEST_BLOB_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - name: Install runtime + test dependencies (PostgreSQL + Azure adapters)
+      - name: Install ffmpeg + Python runtime/test dependencies
         run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
           python -m pip install --disable-pip-version-check \
             -r requirements-test.txt \
             -r v2/requirements-postgres.txt \
             -r v2/requirements-azure.txt
+      - name: Start Azurite (Blob) with API-version check skipped
+        # A GitHub `services:` block cannot override the container command, and
+        # the newer azure-storage-blob SDK needs --skipApiVersionCheck (mirrors
+        # compose.p2.yaml), so run it manually.
+        run: |
+          docker run -d --name azurite -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite:3.33.0 \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+          for i in $(seq 1 20); do
+            # Azurite answers 400 to an unauthenticated GET; a completed
+            # connection (curl exit 0, no -f) means it is listening.
+            curl -s -o /dev/null http://127.0.0.1:10000/devstoreaccount1 && break || sleep 1
+          done
       - name: Apply Alembic migrations to ephemeral PostgreSQL
         run: |
           cd v2 && FOOTBALLAI_DATABASE_URL="$FOOTBALLAI_TEST_DATABASE_URL" \
