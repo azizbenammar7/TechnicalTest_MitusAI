@@ -1,0 +1,123 @@
+# Immutable image build: builds the three linux/amd64 images, proves the
+# psycopg/libpq runtime (the defect that escaped P4 preflight), scans them, and
+# pushes them to ACR tagged with the full Git SHA — authenticated purely via the
+# GitHub OIDC build identity (AcrPush). No ACR admin, no docker password, no
+# `latest`. An image is pushed only after it passes the regression + scan.
+name: Build images
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "v2/**"
+      - "docker/**"
+      - "pipeline/**"
+      - "requirements*.txt"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: false # never kill an in-flight push
+
+jobs:
+  build:
+    name: Build, prove, scan, push (OIDC → ACR)
+    runs-on: ubuntu-latest
+    environment: staging-build # OIDC build identity (AcrPush only)
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SHA: ${{ github.sha }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+      TRIVY_VERSION: "0.74.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate image tag is a 40-char Git SHA (never latest)
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::image tag '$SHA' is not a 40-char lowercase Git SHA"; exit 1; }
+          echo "Image tag: $SHA"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Install Trivy (pinned)
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b "$RUNNER_TEMP/bin" "v${TRIVY_VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Azure login via OIDC (build identity)
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login via AAD token (no admin user, no password)
+        run: az acr login --name "${{ vars.ACR_NAME }}"
+
+      - name: Build (linux/amd64), prove psycopg/libpq, scan, then push
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          declare -A DOCKERFILE=( [frontend]=docker/frontend.Dockerfile [api]=docker/api.Dockerfile [worker]=docker/worker.Dockerfile )
+          declare -A MODULE=( [api]=footballai_v2.api.server [worker]=footballai_v2.worker )
+          echo "## Image build provenance" >> "$GITHUB_STEP_SUMMARY"
+          echo "| image | platform | digest |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          for name in frontend api worker; do
+            IMG="$ACR_LOGIN_SERVER/footballai-$name:$SHA"
+            echo "::group::build footballai-$name"
+            docker buildx build \
+              --platform linux/amd64 --pull --load \
+              -f "${DOCKERFILE[$name]}" -t "$IMG" .
+            echo "::endgroup::"
+
+            # Confirm the image really is linux/amd64.
+            arch=$(docker image inspect "$IMG" --format '{{.Os}}/{{.Architecture}}')
+            [[ "$arch" == "linux/amd64" ]] || { echo "::error::$name is $arch, expected linux/amd64"; exit 1; }
+
+            # Confirm non-root runtime user.
+            uid=$(docker run --rm --entrypoint id "$IMG" -u)
+            [[ "$uid" != "0" ]] || { echo "::error::$name runs as root"; exit 1; }
+
+            # P4 REGRESSION GUARD: prove psycopg imports AND a real (non-pure)
+            # libpq implementation loads inside the actual runtime image.
+            if [[ -n "${MODULE[$name]:-}" ]]; then
+              echo "psycopg/libpq + module import check for $name"
+              docker run --rm --entrypoint python "$IMG" -c "import psycopg, importlib; from psycopg import pq; impl=pq.__impl__; print('psycopg', psycopg.__version__, 'pq impl =', impl); assert impl!='python', 'pure-python psycopg has no usable libpq (the P4 defect)'; importlib.import_module('${MODULE[$name]}'); print('module import OK:', '${MODULE[$name]}')"
+              # API additionally must load Alembic migration config.
+              if [[ "$name" == "api" ]]; then
+                docker run --rm --entrypoint python "$IMG" -c "from alembic.config import Config; Config('/opt/footballai/alembic.ini'); print('alembic config OK')"
+              fi
+            fi
+
+            # Fail on FIXABLE CRITICAL vulns; full HIGH/CRITICAL table is
+            # reported (non-blocking) for visibility and archived via SBOM.
+            echo "::group::trivy scan $name"
+            trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --no-progress "$IMG" || true
+            trivy image --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$IMG"
+            echo "::endgroup::"
+
+            # CycloneDX SBOM for the image.
+            trivy image --format cyclonedx --output "sbom/footballai-$name.$SHA.cdx.json" --no-progress "$IMG"
+
+            # Only now — after all gates pass — push the immutable image.
+            docker push "$IMG"
+            digest=$(docker image inspect "$IMG" --format '{{index .RepoDigests 0}}')
+            echo "footballai-$name -> $digest"
+            echo "| footballai-$name | linux/amd64 | \`${digest##*@}\` |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom/
+          retention-days: 30
