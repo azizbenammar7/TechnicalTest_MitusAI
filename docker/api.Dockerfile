@@ -33,7 +33,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH=/opt/venv/bin:$PATH
 
 WORKDIR /opt/footballai
-RUN apk add --no-cache ffmpeg libpq \
+# Patch base OS packages (openssl/curl/expat/... fixable CVEs) then add runtime deps.
+RUN apk upgrade --no-cache \
+ && apk add --no-cache ffmpeg libpq \
  && addgroup -S -g 10001 footballai \
  && adduser -S -D -H -u 10001 -G footballai footballai \
  && install -d -o footballai -g footballai /var/lib/footballai/runs /var/lib/footballai/queue

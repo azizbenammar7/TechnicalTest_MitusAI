@@ -39,6 +39,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH=/opt/venv/bin:$PATH
 
 RUN apt-get update \
+ && apt-get upgrade --yes \
  && apt-get install --yes --no-install-recommends ffmpeg libgomp1 libpq5 \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 footballai \
