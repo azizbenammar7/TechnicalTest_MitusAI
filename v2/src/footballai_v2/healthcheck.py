@@ -15,7 +15,10 @@ def main() -> None:
     target = sys.argv[1] if len(sys.argv) == 2 else ""
     if target == "api":
         port = int(os.getenv("FOOTBALLAI_API_PORT", "8000"))
-        with urlopen(f"http://127.0.0.1:{port}/api/ready", timeout=2) as response:
+        # False positive: scheme + loopback host are hardcoded and `port` is an
+        # int, so no attacker-controlled value (and no file:// scheme) can reach
+        # urlopen. This is the container's own liveness probe against itself.
+        with urlopen(f"http://127.0.0.1:{port}/api/ready", timeout=2) as response:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             payload = json.load(response)
         if response.status != 200 or payload.get("status") != "ready":
             raise SystemExit(1)

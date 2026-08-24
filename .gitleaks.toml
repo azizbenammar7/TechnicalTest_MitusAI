@@ -1,0 +1,14 @@
+# Gitleaks configuration for FootballAI. Extends the upstream default rule set
+# and adds a single, narrowly-scoped allowlist for one documented non-secret.
+# Never widen this to whole directories to force green CI.
+title = "FootballAI gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Microsoft's public well-known Azurite emulator account key (documented dev-only value, identical to the one in Azure docs/Makefile/compose — not a real credential)."
+regexTarget = "match"
+regexes = [
+  '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==''',
+]
