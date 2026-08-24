@@ -8,12 +8,17 @@ name: Build images
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    # `main` is the steady-state trigger. `feat/p5-devsecops-cicd` is a TEMPORARY
+    # P5-validation allowance (workflow_dispatch only registers from the default
+    # branch, so a branch push is the only way to exercise this before merge).
+    # Remove the feature branch — and the workflow-file path — at P5 close.
+    branches: [main, "feat/p5-devsecops-cicd"]
     paths:
       - "v2/**"
       - "docker/**"
       - "pipeline/**"
       - "requirements*.txt"
+      - ".github/workflows/build-images.yml"
 
 permissions:
   contents: read
