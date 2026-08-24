@@ -19,12 +19,16 @@ class CapabilityProbe:
     def __init__(self, check: Callable[[], bool], *, ttl_seconds: float = 10.0) -> None:
         self._check = check
         self._ttl = ttl_seconds
-        self._checked_at = 0.0
+        # None (not 0.0) forces the first status() call to run the check: on a
+        # freshly-booted host time.monotonic() can be smaller than the TTL, and
+        # a 0.0 sentinel would then wrongly report "unavailable" until the clock
+        # advanced past the TTL.
+        self._checked_at: float | None = None
         self._ready = False
 
     def status(self) -> str:
         now = time.monotonic()
-        if now - self._checked_at >= self._ttl:
+        if self._checked_at is None or now - self._checked_at >= self._ttl:
             try:
                 self._ready = bool(self._check())
             except Exception:  # noqa: BLE001 - readiness never raises

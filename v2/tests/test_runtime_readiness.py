@@ -22,6 +22,14 @@ def test_capability_probe_caches_within_ttl():
     assert calls["n"] == 1  # second call served from cache
 
 
+def test_capability_probe_runs_on_first_call_with_small_monotonic_clock(monkeypatch):
+    # Regression: on a freshly-booted host time.monotonic() can be < ttl. The
+    # first status() call must still run the check and report ready, not skip it.
+    monkeypatch.setattr("footballai_v2.runtime_readiness.time.monotonic", lambda: 1.0)
+    probe = CapabilityProbe(lambda: True, ttl_seconds=100.0)
+    assert probe.status() == "ready"
+
+
 def test_capability_probe_reports_unavailable_on_error():
     def check():
         raise RuntimeError("dependency down")
