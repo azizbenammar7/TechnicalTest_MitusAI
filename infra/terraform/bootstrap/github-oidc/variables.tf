@@ -32,6 +32,18 @@ variable "github_repo" {
   default     = "FootballAi"
 }
 
+variable "github_owner_id" {
+  description = "Numeric GitHub owner (user/org) ID, used to build the IMMUTABLE OIDC subject."
+  type        = string
+  default     = "126194752"
+}
+
+variable "github_repo_id" {
+  description = "Numeric GitHub repository ID, used to build the IMMUTABLE OIDC subject."
+  type        = string
+  default     = "1264402679"
+}
+
 # GitHub Actions environments whose OIDC tokens each identity is allowed to mint.
 variable "build_environment" {
   description = "Environment name for the image-build identity."

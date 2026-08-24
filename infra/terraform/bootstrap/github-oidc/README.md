@@ -28,12 +28,23 @@ Access Administrator.
 
 ## OIDC subject format
 
-Classic. Verified on this repository via
-`gh api repos/azizbenammar7/FootballAi/actions/oidc/customization/sub`
-(`use_immutable_subject=false`, `use_default=true`), so the emitted token
-`sub` is `repo:azizbenammar7/FootballAi:environment:<name>`. If the repository is
-later switched to immutable subjects, update `main.tf`'s `subject_prefix` to the
-`repo:azizbenammar7@126194752/FootballAi@1264402679:environment:<name>` form.
+**Immutable** (`repo:OWNER@<owner_id>/REPO@<repo_id>:environment:<name>`).
+
+Verified *empirically* from a real Actions run on 2026-08-24 — the emitted token
+`sub` is:
+
+```
+repo:azizbenammar7@126194752/FootballAi@1264402679:environment:<name>
+```
+
+The `gh api .../actions/oidc/customization/sub` endpoint reported
+`use_immutable_subject=false`, but that flag was **not** reliable for this repo
+(created after GitHub's immutable-subject rollout); the `sub_claim_prefix` it
+returned was the truth. Federated credentials were initially created with the
+classic subject, the login failed with `AADSTS700213: No matching federated
+identity record`, and the subjects were corrected to the immutable form. If
+GitHub ever reverts this repo to classic subjects, switch `main.tf`'s
+`subject_prefix` back to `repo:${var.github_owner}/${var.github_repo}:environment:`.
 
 ## State isolation
 

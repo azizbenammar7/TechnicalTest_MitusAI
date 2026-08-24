@@ -5,12 +5,16 @@
 # by exactly one GitHub Actions environment via a federated credential. No app
 # registration, no client secret, no AZURE_CREDENTIALS is ever produced.
 #
-# GitHub OIDC subject format: CLASSIC. Verified against this repository on
-# 2026-08-24 via `gh api repos/OWNER/REPO/actions/oidc/customization/sub`:
-#   use_immutable_subject = false, use_default = true
-# => emitted sub = "repo:OWNER/REPO:environment:<name>". If the repository is
-# ever switched to immutable subjects, these `subject` values must be updated to
-# the "repo:OWNER@<owner_id>/REPO@<repo_id>:environment:<name>" form.
+# GitHub OIDC subject format: IMMUTABLE (owner-id/repo-id).
+# VERIFIED EMPIRICALLY on 2026-08-24 from a real Actions run: the token GitHub
+# mints for this repo has
+#   sub = "repo:azizbenammar7@126194752/FootballAi@1264402679:environment:<name>"
+# even though `gh api .../actions/oidc/customization/sub` reported
+# use_immutable_subject=false. That API flag is NOT reliable here; the
+# `sub_claim_prefix` it returns IS the active prefix. The federated credential
+# subject must match the emitted `sub` exactly, so we use the immutable form.
+# If GitHub ever reverts this repo to classic subjects, switch subject_prefix to
+# "repo:${var.github_owner}/${var.github_repo}:environment:".
 # =============================================================================
 
 # --- Existing resources these identities are scoped to (read-only) -----------
@@ -34,8 +38,9 @@ locals {
   # access is needed to plan/apply this bootstrap.
   tfstate_container_scope = "${data.azurerm_storage_account.tfstate.id}/blobServices/default/containers/${var.tfstate_container}"
 
-  # Classic GitHub OIDC subject prefix.
-  subject_prefix = "repo:${var.github_owner}/${var.github_repo}:environment:"
+  # Immutable GitHub OIDC subject prefix (owner-id/repo-id), matching the token
+  # this repo actually emits (verified empirically — see header comment).
+  subject_prefix = "repo:${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}:environment:"
 }
 
 # --- Dedicated resource group for the OIDC identities ------------------------

@@ -5,6 +5,10 @@
 #
 # Trigger is a branch-scoped push (forks cannot push to this branch, so the
 # id-token permission is never exposed to untrusted code) plus manual dispatch.
+#
+# NOTE: this repo emits IMMUTABLE OIDC subjects
+# (repo:OWNER@<owner_id>/REPO@<repo_id>:environment:<name>) — verified from a
+# real run; the Azure federated credentials are matched to that form.
 name: OIDC identity proof
 
 on:
