@@ -10,6 +10,7 @@
 name: Deploy staging
 
 on:
+  # Steady-state trigger (works once this workflow is on the default branch).
   workflow_dispatch:
     inputs:
       image_sha:
@@ -21,6 +22,19 @@ on:
         required: false
         type: boolean
         default: false
+
+  # === TEMPORARY P5 VALIDATION ONLY ===========================================
+  # workflow_dispatch only registers from the default branch, so this push
+  # trigger lets the deploy PLAN be exercised from feat/p5-devsecops-cicd before
+  # merge. It is scoped to that one branch AND to a dedicated trigger file whose
+  # CONTENT carries the target image SHA (the pushed commit's own SHA is NOT the
+  # image tag). The required-reviewer gate on the `staging` environment still
+  # blocks the apply. REMOVE this whole push block (and .github/deploy-request/)
+  # at P5 close, leaving only workflow_dispatch on main.
+  push:
+    branches: ["feat/p5-devsecops-cicd"]
+    paths: [".github/deploy-request/image_sha"]
+  # ============================================================================
 
 permissions:
   contents: read
@@ -34,6 +48,7 @@ env:
   TF_ROOT: infra/terraform/environments/staging
   RG: ${{ vars.AZURE_RESOURCE_GROUP }}
   ACR: ${{ vars.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
   MIGRATION_JOB: caj-footballai-stg-db-migrate
 
 jobs:
@@ -47,12 +62,25 @@ jobs:
       id-token: write
     outputs:
       summary_hash: ${{ steps.policy.outputs.summary_hash }}
+      image_sha: ${{ steps.resolve.outputs.image_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Validate image_sha
+      - name: Resolve and validate image SHA
+        id: resolve
         run: |
-          [[ "${{ inputs.image_sha }}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::image_sha must be a 40-char lowercase Git SHA"; exit 1; }
+          set -euo pipefail
+          # workflow_dispatch carries image_sha as an input; the TEMPORARY push
+          # trigger carries it in the trigger file's content.
+          if [[ -n "${{ inputs.image_sha }}" ]]; then
+            SHA="${{ inputs.image_sha }}"
+          else
+            SHA="$(tr -d '[:space:]' < .github/deploy-request/image_sha)"
+          fi
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::image_sha '$SHA' is not a 40-char lowercase Git SHA"; exit 1; }
+          echo "IMAGE_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "image_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Deploy target image SHA: $SHA"
 
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
@@ -66,13 +94,16 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Verify the three SHA-tagged images exist in ACR
+      - name: Verify the three SHA-tagged images exist and are linux/amd64
         run: |
           set -euo pipefail
+          az acr login --name "$ACR"
           for name in frontend api worker; do
-            tags=$(az acr repository show-tags --name "$ACR" --repository "footballai-$name" -o tsv 2>/dev/null || true)
-            grep -qx "${{ inputs.image_sha }}" <<<"$tags" || { echo "::error::footballai-$name:${{ inputs.image_sha }} not found in ACR"; exit 1; }
-            echo "found footballai-$name:${{ inputs.image_sha }}"
+            img="$ACR_LOGIN_SERVER/footballai-$name:$IMAGE_SHA"
+            docker buildx imagetools inspect "$img" > meta.txt 2>&1 || { echo "::error::$img not found in ACR"; cat meta.txt; exit 1; }
+            grep -q "linux/amd64" meta.txt || { echo "::error::$img is not linux/amd64"; cat meta.txt; exit 1; }
+            digest=$(grep -m1 -oE 'Digest:[[:space:]]*sha256:[0-9a-f]+' meta.txt | grep -oE 'sha256:[0-9a-f]+')
+            echo "footballai-$name: exists, linux/amd64, $digest"
           done
 
       - name: Ensure PostgreSQL is Ready (do not auto-start cost-bearing infra)
@@ -93,7 +124,7 @@ jobs:
           terraform -chdir="$TF_ROOT" plan -input=false -no-color -lock-timeout=120s -out=tfplan \
             -var "subscription_id=${{ vars.AZURE_SUBSCRIPTION_ID }}" \
             -var "deploy_workloads=true" \
-            -var "image_tag=${{ inputs.image_sha }}"
+            -var "image_tag=$IMAGE_SHA"
 
       - name: Machine-checked plan safety policy (no destroy / no replace / no foundation change)
         id: policy
@@ -103,7 +134,7 @@ jobs:
           python3 infra/terraform/scripts/plan_policy.py plan.json | tee policy.txt
           hash=$(awk -F= '/^summary_sha256=/{print $2}' policy.txt)
           echo "summary_hash=$hash" >> "$GITHUB_OUTPUT"
-          { echo "### Staging plan (sanitized)"; echo '```'; cat policy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### Staging plan (sanitized) — image $IMAGE_SHA"; echo '```'; cat policy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   apply:
     name: Apply (approval-gated)
@@ -114,6 +145,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      IMAGE_SHA: ${{ needs.plan.outputs.image_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -132,9 +165,10 @@ jobs:
       - name: Re-verify images still exist
         run: |
           set -euo pipefail
+          az acr login --name "$ACR"
           for name in frontend api worker; do
-            az acr repository show-tags --name "$ACR" --repository "footballai-$name" -o tsv | grep -qx "${{ inputs.image_sha }}" \
-              || { echo "::error::footballai-$name:${{ inputs.image_sha }} missing"; exit 1; }
+            docker buildx imagetools inspect "$ACR_LOGIN_SERVER/footballai-$name:$IMAGE_SHA" >/dev/null \
+              || { echo "::error::footballai-$name:$IMAGE_SHA missing"; exit 1; }
           done
 
       - name: Terraform init + fresh plan
@@ -144,7 +178,7 @@ jobs:
           terraform -chdir="$TF_ROOT" plan -input=false -no-color -lock-timeout=120s -out=tfplan \
             -var "subscription_id=${{ vars.AZURE_SUBSCRIPTION_ID }}" \
             -var "deploy_workloads=true" \
-            -var "image_tag=${{ inputs.image_sha }}"
+            -var "image_tag=$IMAGE_SHA"
 
       - name: Re-run safety policy and prove plan equivalence to approved plan
         run: |
