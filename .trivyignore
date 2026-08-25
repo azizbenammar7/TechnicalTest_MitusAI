@@ -1,0 +1,12 @@
+# Trivy misconfiguration exceptions — each entry is a deliberate, documented
+# accepted risk. Keep this list minimal and justified; never blanket-ignore.
+
+# AZU-0012: "Storage account network default action should be Deny."
+# Accepted for FootballAI staging. Both Storage Accounts (application data +
+# Terraform state) authenticate exclusively via Microsoft Entra (shared-key
+# access is disabled, storage_use_azuread=true). Setting the network default
+# action to Deny would require VNet integration / private endpoints for the
+# Container Apps data plane and for GitHub Actions state access, which is out of
+# scope for this student-subscription staging environment. Revisit if the
+# environment is promoted toward production. Tracked for P6/hardening.
+AZU-0012

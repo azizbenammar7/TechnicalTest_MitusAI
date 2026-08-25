@@ -29,7 +29,7 @@ def upload(client: TestClient, *, profile="demo_fast", filename="match.mp4", con
 def execute_one(client: TestClient, settings: ExecutionSettings):
     job = client.app.state.run_store and AnalysisCoordinator(settings).queue.claim("test-worker")
     assert job
-    status = AnalysisExecutor(client.app.state.run_store, stage_delay_seconds=0).execute(job, "test-worker")
+    status = AnalysisExecutor(client.app.state.run_store, client.app.state.object_storage, stage_delay_seconds=0).execute(job, "test-worker")
     if status.value in {"succeeded", "partial"}: AnalysisCoordinator(settings).queue.complete(job)
     else: AnalysisCoordinator(settings).queue.fail(job)
     return job, status
@@ -108,9 +108,9 @@ def test_queued_and_running_cancellation_are_persistent(workflow):
     queued = upload(client).json(); assert client.post(f"/api/v1/runs/{queued['run_id']}/cancel").json()["status"] == "cancelled"
     assert client.post(f"/api/v1/runs/{queued['run_id']}/retry").status_code == 409
     running = upload(client).json(); coordinator = AnalysisCoordinator(settings); job = coordinator.queue.claim("worker"); assert job
-    run = coordinator.store.load(running["run_id"]); coordinator.store.save(run.start(stages=run.stages))
+    run = coordinator.repository.load(running["run_id"]); coordinator.repository.save(run.start(stages=run.stages))
     assert client.post(f"/api/v1/runs/{run.run_id}/cancel").json()["status"] == "running"
-    assert AnalysisExecutor(coordinator.store, stage_delay_seconds=0).execute(job, "worker").value == "cancelled"
+    assert AnalysisExecutor(coordinator.repository, coordinator.object_storage, stage_delay_seconds=0).execute(job, "worker").value == "cancelled"
     assert client.get(f"/api/v1/runs/{run.run_id}/progress").json()["can_create_new_from_input"] is True
 
 

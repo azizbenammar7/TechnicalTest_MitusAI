@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars (ignored by Git) and fill from `az account show`.
+# Must be the Azure for Students subscription, ESPRIT tenant.
+subscription_id = "00000000-0000-0000-0000-000000000000"
+location        = "France Central"
+
+# All other inputs default to the FootballAI staging names in variables.tf.
+# Override github_owner/github_repo only if the repository is renamed/forked.

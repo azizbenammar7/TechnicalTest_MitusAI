@@ -5,6 +5,13 @@ preserved V1 technical-test implementation. V2 does not import from
 or write into `../pipeline/`, `../dashboard/`, `../scripts/`, or
 `../data/processed/`.
 
+The production-like container boundary is documented in
+[`../docs/v2/production-containerization.md`](../docs/v2/production-containerization.md).
+The P2 cloud adapters (PostgreSQL control plane, Azure Blob data plane with
+direct upload, Azure Service Bus queue) and their fail-fast composition root are
+documented in
+[`../docs/v2/production-cloud-adapters.md`](../docs/v2/production-cloud-adapters.md).
+
 ## Analysis-run contract
 
 The first published analysis-run contract is:

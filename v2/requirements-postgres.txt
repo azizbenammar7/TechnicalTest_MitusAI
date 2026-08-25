@@ -1,0 +1,12 @@
+# PostgreSQL control-plane lock (P2). Installed into the API image, which owns
+# the analysis-run lifecycle. Sync psycopg + SQLAlchemy Core + Alembic; no ORM.
+# psycopg-c is the compiled implementation: it links the system libpq and is the
+# only implementation that works on musl (Alpine) since psycopg-binary ships no
+# musllinux wheels. Requires a C toolchain + libpq headers at build time and the
+# libpq runtime library in the final image.
+SQLAlchemy==2.0.52
+psycopg==3.3.4
+psycopg-c==3.3.4
+alembic==1.19.1
+Mako==1.4.1
+MarkupSafe==3.0.3

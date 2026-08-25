@@ -1,0 +1,214 @@
+# Controlled staging deployment. Two jobs with a real human approval boundary:
+#
+#   plan  (staging-plan env, Reader) -> sanitized safety-checked plan + hash
+#     |   required reviewer approval on the `staging` environment
+#   apply (staging env, Contributor) -> re-plan, hash-match, apply, migrate, smoke
+#
+# Authentication is GitHub OIDC only (no secret). A deploy never destroys or
+# replaces, and never touches foundation resources (enforced by plan_policy.py).
+# Deploy a rollback by passing an older image_sha whose images already exist.
+name: Deploy staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: "40-char Git SHA of images already pushed to ACR (rollback = an older SHA)"
+        required: true
+        type: string
+      run_e2e:
+        description: "After deploy, also probe the analysis API surface (bounded; not a full video run)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Serialize staging deployments; never cancel an in-flight terraform apply.
+concurrency:
+  group: footballai-staging-deploy
+  cancel-in-progress: false
+
+env:
+  TF_ROOT: infra/terraform/environments/staging
+  RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  ACR: ${{ vars.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+  MIGRATION_JOB: caj-footballai-stg-db-migrate
+
+jobs:
+  plan:
+    name: Plan (safety-gated)
+    runs-on: ubuntu-latest
+    environment: staging-plan # OIDC plan identity (Reader + state + AcrPull)
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      summary_hash: ${{ steps.policy.outputs.summary_hash }}
+      image_sha: ${{ steps.resolve.outputs.image_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve and validate image SHA
+        id: resolve
+        run: |
+          set -euo pipefail
+          SHA="${{ inputs.image_sha }}"
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::image_sha '$SHA' is not a 40-char lowercase Git SHA"; exit 1; }
+          echo "IMAGE_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "image_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Deploy target image SHA: $SHA"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Azure login via OIDC (plan identity)
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify the three SHA-tagged images exist and are linux/amd64
+        run: |
+          set -euo pipefail
+          az acr login --name "$ACR"
+          for name in frontend api worker; do
+            img="$ACR_LOGIN_SERVER/footballai-$name:$IMAGE_SHA"
+            plat=$(docker buildx imagetools inspect "$img" --format '{{.Image.OS}}/{{.Image.Architecture}}' 2>/dev/null) \
+              || { echo "::error::$img not found in ACR"; exit 1; }
+            [[ "$plat" == "linux/amd64" ]] || { echo "::error::$img is $plat, expected linux/amd64"; exit 1; }
+            digest=$(docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}' 2>/dev/null || echo "?")
+            echo "footballai-$name: exists, $plat, $digest"
+          done
+
+      - name: Ensure PostgreSQL is Ready (do not auto-start cost-bearing infra)
+        run: |
+          set -euo pipefail
+          PG_NAME=$(az postgres flexible-server list -g "$RG" --query '[0].name' -o tsv)
+          # `show` (GET) reliably returns `state`; the `list` projection can omit it.
+          PG_STATE=$(az postgres flexible-server show -g "$RG" -n "$PG_NAME" --query 'state' -o tsv)
+          echo "PostgreSQL $PG_NAME state=$PG_STATE"
+          if [[ "$PG_STATE" != "Ready" ]]; then
+            echo "::error::PostgreSQL '$PG_NAME' is '$PG_STATE'. Start it deliberately before deploying:"
+            echo "::error::  az postgres flexible-server start -g $RG -n $PG_NAME"
+            exit 1
+          fi
+
+      - name: Terraform init + plan
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_ROOT" init -input=false -no-color
+          terraform -chdir="$TF_ROOT" plan -input=false -no-color -lock-timeout=120s -out=tfplan \
+            -var "subscription_id=${{ vars.AZURE_SUBSCRIPTION_ID }}" \
+            -var "deploy_workloads=true" \
+            -var "image_tag=$IMAGE_SHA"
+
+      - name: Machine-checked plan safety policy (no destroy / no replace / no foundation change)
+        id: policy
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_ROOT" show -json tfplan > plan.json
+          python3 infra/terraform/scripts/plan_policy.py plan.json | tee policy.txt
+          hash=$(awk -F= '/^summary_sha256=/{print $2}' policy.txt)
+          echo "summary_hash=$hash" >> "$GITHUB_OUTPUT"
+          { echo "### Staging plan (sanitized) — image $IMAGE_SHA"; echo '```'; cat policy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: Apply (approval-gated)
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: staging # OIDC deploy identity + REQUIRED REVIEWER approval
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE_SHA: ${{ needs.plan.outputs.image_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Azure login via OIDC (deploy identity)
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Re-verify images still exist
+        run: |
+          set -euo pipefail
+          az acr login --name "$ACR"
+          for name in frontend api worker; do
+            docker buildx imagetools inspect "$ACR_LOGIN_SERVER/footballai-$name:$IMAGE_SHA" >/dev/null \
+              || { echo "::error::footballai-$name:$IMAGE_SHA missing"; exit 1; }
+          done
+
+      - name: Terraform init + fresh plan
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_ROOT" init -input=false -no-color
+          terraform -chdir="$TF_ROOT" plan -input=false -no-color -lock-timeout=120s -out=tfplan \
+            -var "subscription_id=${{ vars.AZURE_SUBSCRIPTION_ID }}" \
+            -var "deploy_workloads=true" \
+            -var "image_tag=$IMAGE_SHA"
+
+      - name: Re-run safety policy and prove plan equivalence to approved plan
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_ROOT" show -json tfplan > plan.json
+          python3 infra/terraform/scripts/plan_policy.py plan.json | tee policy.txt
+          hash=$(awk -F= '/^summary_sha256=/{print $2}' policy.txt)
+          approved="${{ needs.plan.outputs.summary_hash }}"
+          echo "approved=$approved current=$hash"
+          [[ "$hash" == "$approved" ]] || { echo "::error::plan changed since approval ($approved -> $hash); refusing to apply"; exit 1; }
+
+      - name: Terraform apply (exact approved plan)
+        run: terraform -chdir="$TF_ROOT" apply -input=false -no-color -lock-timeout=120s tfplan
+
+      - name: Run database migration job and wait
+        run: |
+          set -euo pipefail
+          echo "Starting $MIGRATION_JOB..."
+          az containerapp job start -n "$MIGRATION_JOB" -g "$RG" -o none
+          exec_name=$(az containerapp job execution list -n "$MIGRATION_JOB" -g "$RG" --query "[0].name" -o tsv)
+          echo "Execution: $exec_name"
+          for i in $(seq 1 60); do
+            status=$(az containerapp job execution show -n "$MIGRATION_JOB" -g "$RG" --job-execution-name "$exec_name" --query "properties.status" -o tsv)
+            echo "  [$i] status=$status"
+            case "$status" in
+              Succeeded) echo "migration succeeded"; exit 0 ;;
+              Failed|Degraded) echo "::error::migration $status"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::migration did not complete in time"; exit 1
+
+      - name: Post-deploy smoke (frontend health + API readiness via proxy)
+        run: bash scripts/ci/smoke-staging.sh
+
+      - name: Optional analysis-API-surface probe (run_e2e)
+        if: ${{ inputs.run_e2e }}
+        run: |
+          set -euo pipefail
+          FQDN=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name ca-footballai-stg-frontend \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+          test -n "$FQDN"
+          profiles=$(curl -fsS "https://$FQDN/api/v1/pipeline-profiles")
+          echo "$profiles"
+          echo "$profiles" | python3 -c "import sys,json; d=json.load(sys.stdin); ids=[p['profile_id'] for p in d['profiles']]; assert 'demo_fast' in ids, ids; print('analysis control plane reachable; demo_fast present:', ids)"
+          echo "NOTE: a full demo_fast video run remains the P4-proven manual validation."

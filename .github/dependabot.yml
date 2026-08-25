@@ -1,0 +1,49 @@
+version: 2
+updates:
+  # Pinned GitHub Actions (keeps the SHA pins current).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Frontend npm dependencies.
+  - package-ecosystem: npm
+    directory: "/v2/dashboard"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Python requirement locks (root + v2 runtime/test locks).
+  - package-ecosystem: pip
+    directories: ["/", "/v2"]
+    schedule:
+      interval: weekly
+      day: wednesday
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    groups:
+      python-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Container base images (Dockerfiles live under /docker).
+  - package-ecosystem: docker
+    directory: "/docker"
+    schedule:
+      interval: monthly
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 2

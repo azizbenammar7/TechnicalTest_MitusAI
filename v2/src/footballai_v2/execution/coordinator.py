@@ -17,8 +17,6 @@ from footballai_v2.contracts.v1 import (
 from footballai_v2.execution.adapters import profile_catalog
 from footballai_v2.execution.adapters.v1_compat_runtime import check_v1_compat_readiness
 from footballai_v2.execution.contracts import ExecutionJob
-from footballai_v2.execution.queue import LocalFilesystemQueue
-from footballai_v2.storage import LocalAnalysisRunStore, ManifestConflictError
 
 
 MEDIA_TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".webm": "video/webm"}
@@ -39,6 +37,23 @@ class ExecutionSettings:
     allowed_extensions: tuple[str, ...] = (".mp4", ".mov", ".mkv", ".webm")
     ffprobe_timeout_seconds: float = 10
     allow_test_profiles: bool = False
+    environment: str = "local"
+    queue_backend: str = "local"
+    object_storage_backend: str = "local"
+    database_backend: str = "local_manifest"
+
+    def __post_init__(self) -> None:
+        if self.environment not in {"local", "staging", "production", "test"}:
+            raise ValueError("FOOTBALLAI_ENVIRONMENT must be local, staging, production, or test")
+        # Backend selection and its required configuration are validated by the
+        # composition root, which fails fast and never silently falls back.
+        from footballai_v2.composition import validate_backend_configuration
+
+        validate_backend_configuration(self)
+        if self.max_upload_bytes < 1:
+            raise ValueError("FOOTBALLAI_MAX_UPLOAD_BYTES must be positive")
+        if self.max_video_duration_seconds <= 0:
+            raise ValueError("FOOTBALLAI_MAX_VIDEO_DURATION_SECONDS must be positive")
 
     @classmethod
     def from_environment(cls, run_root: str | Path | None = None, queue_root: str | Path | None = None) -> "ExecutionSettings":
@@ -47,23 +62,49 @@ class ExecutionSettings:
             for item in os.getenv("FOOTBALLAI_ALLOWED_VIDEO_EXTENSIONS", ".mp4,.mov,.mkv,.webm").split(",") if item.strip()
         )
         return cls(
-            Path(run_root or os.getenv("FOOTBALLAI_V2_RUN_ROOT", "data/runs")),
-            Path(queue_root or os.getenv("FOOTBALLAI_V2_QUEUE_ROOT", "data/job-queue")),
-            int(os.getenv("FOOTBALLAI_MAX_UPLOAD_BYTES", str(250 * 1024 * 1024))),
-            float(os.getenv("FOOTBALLAI_MAX_VIDEO_DURATION_SECONDS", str(4 * 60 * 60))),
-            extensions,
-            float(os.getenv("FFPROBE_TIMEOUT_SECONDS", "10")),
-            os.getenv("FOOTBALLAI_ENABLE_TEST_PROFILES", "0") == "1",
+            run_root=Path(run_root or os.getenv("FOOTBALLAI_V2_RUN_ROOT", "data/runs")),
+            queue_root=Path(queue_root or os.getenv("FOOTBALLAI_V2_QUEUE_ROOT", "data/job-queue")),
+            max_upload_bytes=int(os.getenv("FOOTBALLAI_MAX_UPLOAD_BYTES", str(250 * 1024 * 1024))),
+            max_video_duration_seconds=float(os.getenv("FOOTBALLAI_MAX_VIDEO_DURATION_SECONDS", str(4 * 60 * 60))),
+            allowed_extensions=extensions,
+            ffprobe_timeout_seconds=float(os.getenv("FFPROBE_TIMEOUT_SECONDS", "10")),
+            allow_test_profiles=os.getenv("FOOTBALLAI_ENABLE_TEST_PROFILES", "0") == "1",
+            environment=os.getenv("FOOTBALLAI_ENVIRONMENT", "local").strip().lower(),
+            queue_backend=os.getenv("FOOTBALLAI_QUEUE_BACKEND", "local").strip().lower(),
+            object_storage_backend=os.getenv("FOOTBALLAI_OBJECT_STORAGE_BACKEND", "local").strip().lower(),
+            database_backend=os.getenv("FOOTBALLAI_DATABASE_BACKEND", "local_manifest").strip().lower(),
         )
 
 
 class AnalysisCoordinator:
-    def __init__(self, settings: ExecutionSettings) -> None:
+    """Multipart ingestion + attempt lifecycle over provider-neutral planes.
+
+    Depends only on an :class:`AnalysisRepository` (control plane), an
+    :class:`ObjectStorage` (data plane), and a :class:`JobQueue` (delivery). The
+    same coordinator runs local, split (PostgreSQL + Blob + local queue), or full
+    Azure -- it never requires a shared filesystem. The browser still streams the
+    upload to the API here (the legacy/local-friendly path); the direct-to-object
+    :class:`DirectUploadService` remains the preferred cloud ingestion route.
+    """
+
+    def __init__(
+        self,
+        settings: ExecutionSettings,
+        *,
+        repository=None,
+        object_storage=None,
+        queue=None,
+    ) -> None:
+        from footballai_v2 import composition
+
         self.settings = settings
-        self.store = LocalAnalysisRunStore(settings.run_root)
-        self.queue = LocalFilesystemQueue(settings.queue_root)
-        self.upload_root = self.store.root / ".uploads"
-        self.upload_root.mkdir(exist_ok=True)
+        self.repository = repository or composition.create_analysis_repository(settings)
+        self.object_storage = object_storage or composition.create_object_storage(settings)
+        self.queue = queue or composition.create_job_queue(settings, repository=self.repository)
+        # API-local scratch for streaming + probing one upload before it is handed
+        # to object storage. Ephemeral only; never authoritative and never shared.
+        self.upload_root = Path(tempfile.gettempdir()) / "footballai-uploads"
+        self.upload_root.mkdir(parents=True, exist_ok=True)
 
     def stream_upload(self, source: BinaryIO, filename: str) -> tuple[Path, str, int, str]:
         extension = self._validate_filename(filename)
@@ -139,61 +180,50 @@ class AnalysisCoordinator:
             models = (ModelReference("yolov8m.pt", "ultralytics-yolov8m", readiness.config.model_sha256),)
         run = AnalysisRun.new(
             data_origin=origin, input=InputReference(f"run-input://source{extension}", checksum, MEDIA_TYPES[extension]),
-            code=self._code_reference(), pipeline_version=f"{profile}/1.0.0", parameters=parameters,
+            code=self.code_reference(), pipeline_version=f"{profile}/1.0.0", parameters=parameters,
             models=models,
             stages=self._queued_stages(1, profile),
         )
-        run_dir = self.store.create(run)
-        destination = run_dir / "input" / f"source{extension}"
+        self.repository.create(run)
         try:
-            os.replace(temporary, destination)
+            # put_input_file copies bytes into object storage; the coordinator
+            # keeps ownership of the scratch file and removes it in the finally.
+            self.object_storage.put_input_file(run.run_id, temporary, extension=extension, content_type=MEDIA_TYPES[extension])
             self.queue.enqueue(ExecutionJob.new(run.run_id, run.logical_analysis_id, run.attempt_number, profile))
         except Exception:
             if not run.status.is_terminal:
                 from footballai_v2.contracts.v1 import StructuredError, utc_now
-                self.store.save(run.fail(StructuredError("ingestion_failed", "The validated upload could not be queued.", True, utc_now())))
-            temporary.unlink(missing_ok=True)
+                self.repository.save(run.fail(StructuredError("ingestion_failed", "The validated upload could not be queued.", True, utc_now())))
             raise
+        finally:
+            temporary.unlink(missing_ok=True)
         return run
 
     def retry(self, run_id: str) -> AnalysisRun:
-        previous = self.store.load(run_id)
+        previous = self.repository.load(run_id)
         profile = str(previous.parameters["pipeline_profile"])
         retry = AnalysisRun.retry_from(previous).with_stages(self._queued_stages(previous.attempt_number + 1, profile))
-        self.store.create(retry)
+        self.repository.create(retry)
         try:
-            self._copy_input(previous.run_id, retry.run_id)
+            self.object_storage.copy_input(previous.run_id, retry.run_id)
             self.queue.enqueue(ExecutionJob.new(retry.run_id, retry.logical_analysis_id, retry.attempt_number, profile))
         except Exception:
-            self.store.save(retry.fail(StructuredError("input_copy_failed", "The source input could not be copied safely.", False, utc_now())))
+            self.repository.save(retry.fail(StructuredError("input_copy_failed", "The source input could not be copied safely.", False, utc_now())))
             raise
         return retry
 
     def clone(self, run_id: str) -> AnalysisRun:
-        previous = self.store.load(run_id)
+        previous = self.repository.load(run_id)
         profile = str(previous.parameters["pipeline_profile"])
-        clone = AnalysisRun.new(data_origin=previous.data_origin, input=previous.input, code=self._code_reference(), pipeline_version=previous.pipeline_version, parameters=dict(previous.parameters), models=previous.models, stages=self._queued_stages(1, profile))
-        self.store.create(clone)
+        clone = AnalysisRun.new(data_origin=previous.data_origin, input=previous.input, code=self.code_reference(), pipeline_version=previous.pipeline_version, parameters=dict(previous.parameters), models=previous.models, stages=self._queued_stages(1, profile))
+        self.repository.create(clone)
         try:
-            self._copy_input(previous.run_id, clone.run_id)
+            self.object_storage.copy_input(previous.run_id, clone.run_id)
             self.queue.enqueue(ExecutionJob.new(clone.run_id, clone.logical_analysis_id, 1, profile))
         except Exception:
-            self.store.save(clone.fail(StructuredError("input_copy_failed", "The source input could not be copied safely.", False, utc_now())))
+            self.repository.save(clone.fail(StructuredError("input_copy_failed", "The source input could not be copied safely.", False, utc_now())))
             raise
         return clone
-
-    def _copy_input(self, source_run_id: str, destination_run_id: str) -> None:
-        source_run = self.store.load(source_run_id)
-        source = self.store.input_path(source_run_id)
-        destination = self.store.run_directory(destination_run_id) / "input" / source.name
-        digest = hashlib.sha256()
-        with source.open("rb") as reader, destination.open("xb") as writer:
-            while chunk := reader.read(1024 * 1024):
-                digest.update(chunk); writer.write(chunk)
-            writer.flush(); os.fsync(writer.fileno())
-        if digest.hexdigest() != source_run.input.sha256:
-            destination.unlink(missing_ok=True)
-            raise ManifestConflictError("source input integrity check failed")
 
     def _validate_filename(self, filename: str) -> str:
         if not filename or len(filename) > 255 or "\x00" in filename or Path(filename).name != filename or ".." in filename:
@@ -209,7 +239,7 @@ class AnalysisCoordinator:
         return tuple(StageExecution(name.value, name, name not in unsupported, StageStatus.QUEUED, 0, attempt) for name in StageName)
 
     @staticmethod
-    def _code_reference() -> CodeReference:
+    def code_reference() -> CodeReference:
         revision = os.getenv("FOOTBALLAI_CODE_REVISION", "").lower()
         dirty = os.getenv("FOOTBALLAI_CODE_DIRTY")
         if not revision:

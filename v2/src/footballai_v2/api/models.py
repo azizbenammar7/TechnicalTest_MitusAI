@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import UUID4, BaseModel, ConfigDict, Field
 
 
 class PublicModel(BaseModel):
@@ -15,6 +16,13 @@ class HealthResponse(PublicModel):
     status: str
     service: str
     contract_version: str
+
+
+class ReadinessResponse(PublicModel):
+    status: str
+    service: str
+    environment: str
+    checks: dict[str, str]
 
 
 class PipelineProfile(PublicModel):
@@ -43,6 +51,37 @@ class QueuedRunResponse(PublicModel):
     attempt_number: int
     status: str
     progress_url: str
+
+
+class DirectUploadAuthorizeRequest(PublicModel):
+    content_type: str = Field(min_length=1, max_length=100)
+
+
+class DirectUploadAuthorization(PublicModel):
+    method: str
+    url: str
+    headers: dict[str, str]
+    max_bytes: int
+    expires_at: datetime
+    required_content_type: str
+
+
+class DirectUploadAuthorizeResponse(PublicModel):
+    run_id: str
+    upload: DirectUploadAuthorization
+
+
+class DirectUploadFinalizeRequest(PublicModel):
+    run_id: UUID4
+    match_name: str = Field(min_length=1, max_length=160)
+    home_team: str = Field(default="", max_length=100)
+    away_team: str = Field(default="", max_length=100)
+    competition: str = Field(default="", max_length=120)
+    match_date: str = Field(default="", max_length=32)
+    venue: str = Field(default="", max_length=160)
+    notes: str = Field(default="", max_length=1000)
+    data_origin: str = Field(default="real", max_length=32)
+    pipeline_profile: str = Field(default="demo_fast", max_length=64)
 
 
 class ProgressResponse(PublicModel):

@@ -37,6 +37,48 @@ See [`docs/v2/V1_COMPAT_SETUP.md`](docs/v2/V1_COMPAT_SETUP.md). `v1_compat`
 is a preserved-algorithm compatibility profile. It is not the future
 detector-neutral V2 production engine.
 
+Production Platform status: **P1 containerized service boundaries are
+implemented and locally validated** for the compiled React frontend, FastAPI
+API, and long-lived worker. Start the local stack with `make p1-build && make
+p1-up`; see
+[`docs/v2/production-containerization.md`](docs/v2/production-containerization.md).
+
+**P2 cloud adapters are implemented behind the provider-neutral ports**:
+`PostgreSQLAnalysisRepository` (control plane, emulator-validated against a
+PostgreSQL container), `AzureBlobObjectStorage` with a direct-upload boundary
+(data plane, emulator-validated against Azurite), and `AzureServiceBusQueue`
+(implemented and subsequently validated in real Azure). A fail-fast composition root selects backends via
+`FOOTBALLAI_{DATABASE,OBJECT_STORAGE,QUEUE}_BACKEND`; the local adapters remain
+the default.
+
+**The real coordinator, worker, executor, and API read path now run entirely
+through the ports** (`AnalysisRepository` + `ObjectStorage` + `JobQueue`), with
+no shared filesystem between the API and the worker. The same execution code
+runs locally or split across PostgreSQL + Blob-compatible storage + queue; a
+split-plane end-to-end test drives `demo_fast`, retry, cancellation,
+deterministic failure, and duplicate-delivery idempotency against PostgreSQL +
+Azurite (`make p2-split-up && make p2-split-test`). No Azure resources were
+created and no Azure credit consumed. See
+[`docs/v2/production-cloud-adapters.md`](docs/v2/production-cloud-adapters.md)
+and run the emulator-backed suite with `make p2-db-up && make p2-test`.
+
+**P3 Azure/Terraform and P4 real-Azure staging validation are complete.** The
+low-cost France Central topology provisions Blob Storage, Service Bus, private
+PostgreSQL, ACR, a VNet-integrated Container Apps environment, separate managed
+identities, frontend/API Container Apps and event-driven worker/migration Jobs.
+Immutable images, migration, readiness and the split execution path have been
+validated in the real staging environment. See
+[`docs/v2/azure-staging-architecture.md`](docs/v2/azure-staging-architecture.md)
+and [`docs/v2/terraform.md`](docs/v2/terraform.md).
+
+**P5 CI/CD and DevSecOps are complete and ready for review.** Pull requests run
+Python, split-plane integration, frontend, Terraform and security gates. Main
+builds immutable SHA-tagged images and publishes SBOMs through a secretless OIDC
+build identity. Staging deployment is manual and accepts an explicit image SHA,
+then separates safety-gated planning from reviewer-gated apply, migration and a
+stable-FQDN smoke. See
+[`docs/v2/devsecops-cicd.md`](docs/v2/devsecops-cicd.md).
+
 The remaining README is the preserved V1 technical-test documentation.
 
 End-to-end pipeline: detect & track players in a full 90-minute match →

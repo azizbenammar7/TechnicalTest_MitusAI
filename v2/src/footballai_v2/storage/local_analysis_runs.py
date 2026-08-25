@@ -6,8 +6,9 @@ import hashlib
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 from footballai_v2.contracts.v1 import (
     AnalysisRun,
@@ -17,6 +18,7 @@ from footballai_v2.contracts.v1 import (
     CodeReference,
     JsonValue,
     ModelReference,
+    utc_now,
 )
 from footballai_v2.contracts.v1.analysis_run import (
     ContractValidationError,
@@ -149,6 +151,84 @@ class LocalAnalysisRunStore:
         self._require_within_run(candidates[0].resolve(), run_dir)
         return candidates[0]
 
+    @contextmanager
+    def materialize_input(self, run_id: str) -> Iterator[Path]:
+        """Yield a local input path; cloud adapters may download to bounded temporary storage."""
+        yield self.input_path(run_id)
+
+    def put_input_file(
+        self, run_id: str, source_path: str | Path, *, extension: str, content_type: str
+    ) -> str:
+        """Ingest a validated local file as this run's single input (write-once).
+
+        The caller retains ownership of ``source_path`` and cleans it up. The
+        returned reference is the run-scoped object key, matching the shape every
+        object-storage adapter uses.
+        """
+        if not extension.startswith(".") or "/" in extension or "\\" in extension:
+            raise ValueError("extension must be a leading-dot suffix such as '.mp4'")
+        run_dir = self._require_run_directory(run_id)
+        destination = run_dir / "input" / f"source{extension}"
+        with Path(source_path).open("rb") as reader, destination.open("xb") as writer:
+            while chunk := reader.read(1024 * 1024):
+                writer.write(chunk)
+            writer.flush()
+            os.fsync(writer.fileno())
+        return f"runs/{validate_run_id(run_id)}/input/source{extension}"
+
+    def copy_input(self, source_run_id: str, destination_run_id: str) -> None:
+        """Copy the single input of one run into another, verifying integrity."""
+        source_run = self.load(source_run_id)
+        source = self.input_path(source_run_id)
+        destination = self._require_run_directory(destination_run_id) / "input" / source.name
+        digest = hashlib.sha256()
+        with source.open("rb") as reader, destination.open("xb") as writer:
+            while chunk := reader.read(1024 * 1024):
+                digest.update(chunk)
+                writer.write(chunk)
+            writer.flush()
+            os.fsync(writer.fileno())
+        if digest.hexdigest() != source_run.input.sha256:
+            destination.unlink(missing_ok=True)
+            raise ManifestConflictError("source input integrity check failed")
+
+    def has_input(self, run_id: str) -> bool:
+        """Return whether the run has exactly one safe uploaded input."""
+        try:
+            self.input_path(run_id)
+        except (ManifestConflictError, RunNotFoundError, ContractValidationError):
+            return False
+        return True
+
+    # -- cancellation (control-plane intent, local adapter) ------------------
+    #
+    # Cancellation is authoritative control-plane state exposed through the
+    # AnalysisRepository port. The local adapter records intent as an atomic
+    # marker file inside the run namespace; callers never see this mechanism --
+    # they use request_cancellation / cancellation_requested only.
+    CANCEL_MARKER = "cancel-request.json"
+
+    def request_cancellation(self, run_id: str) -> None:
+        run_dir = self._require_run_directory(run_id)
+        if self.load(run_id).status.is_terminal:
+            return
+        payload = (
+            json.dumps({"requested_at": utc_now().isoformat().replace("+00:00", "Z")}) + "\n"
+        )
+        fd, temporary = tempfile.mkstemp(prefix=".cancel-", dir=run_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, run_dir / self.CANCEL_MARKER)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    def cancellation_requested(self, run_id: str) -> bool:
+        marker = self.run_directory(run_id) / self.CANCEL_MARKER
+        return marker.is_file() and not marker.is_symlink()
+
     def create_retry_attempt(
         self,
         previous_run_id: str,
@@ -227,6 +307,24 @@ class LocalAnalysisRunStore:
         except (ManifestConflictError, RunNotFoundError, OSError):
             return False
         return True
+
+    def artifact_reference_integrity(self, run_id: str, reference: ArtifactReference) -> bool:
+        """Verify a just-written artifact against its reference, without the manifest.
+
+        Used by the executor to gate a terminal transition before the artifact
+        list has been persisted, so it cannot resolve an id through the manifest.
+        """
+        try:
+            path = self.artifact_path(run_id, reference.relative_path)
+            if not path.is_file() or path.is_symlink():
+                return False
+            content = path.read_bytes()
+        except (ContractValidationError, ManifestConflictError, RunNotFoundError, OSError):
+            return False
+        return (
+            len(content) == reference.size_bytes
+            and hashlib.sha256(content).hexdigest() == reference.sha256
+        )
 
     def write_artifact(
         self,

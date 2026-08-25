@@ -15,11 +15,30 @@ test = [
   "jsonschema==4.25.1",
   "pytest==8.4.1",
   "python-multipart==0.0.22",
+  # P2 cloud-adapter test dependencies (integration tests skip without emulators).
+  "SQLAlchemy==2.0.52",
+  "psycopg==3.3.4",
+  "alembic==1.19.1",
+  "azure-storage-blob==12.30.0",
+  "azure-servicebus==7.14.3",
+  "azure-identity==1.25.3",
 ]
 api = [
   "fastapi==0.140.0",
   "uvicorn==0.51.0",
   "python-multipart==0.0.22",
+]
+# P2 control plane (PostgreSQL). See requirements-postgres.txt for the pinned lock.
+postgres = [
+  "SQLAlchemy==2.0.52",
+  "psycopg==3.3.4",
+  "alembic==1.19.1",
+]
+# P2 cloud data plane + queue (Azure). See requirements-azure.txt for the lock.
+cloud = [
+  "azure-storage-blob==12.30.0",
+  "azure-servicebus==7.14.3",
+  "azure-identity==1.25.3",
 ]
 
 [tool.setuptools.packages.find]

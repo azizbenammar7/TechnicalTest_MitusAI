@@ -112,11 +112,27 @@ def test_health_has_contract_and_request_diagnostics(api_context):
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
-        "service": "footballai-v2-local-api",
+        "service": "footballai-api",
         "contract_version": "footballai.analysis-run/v1",
     }
     assert response.headers["x-request-id"]
     assert float(response.headers["x-response-time-ms"]) >= 0
+
+
+def test_readiness_checks_real_local_dependencies(api_context):
+    client, _, _ = api_context
+    response = client.get("/api/ready")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "service": "footballai-api",
+        "environment": "local",
+        "checks": {
+            "run_storage": "ready",
+            "queue": "ready",
+            "video_probe": "ready",
+        },
+    }
 
 
 def test_list_runs_exposes_stable_overview_fields(api_context):

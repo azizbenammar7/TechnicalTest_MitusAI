@@ -1,0 +1,87 @@
+name: footballai
+
+services:
+  frontend:
+    image: footballai-frontend:local
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    environment:
+      FOOTBALLAI_FRONTEND_API_BASE: ""
+    ports:
+      - "${FOOTBALLAI_FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  api:
+    image: footballai-api:local
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      FOOTBALLAI_ENVIRONMENT: local
+      FOOTBALLAI_LOG_LEVEL: "${FOOTBALLAI_LOG_LEVEL:-INFO}"
+      FOOTBALLAI_V2_RUN_ROOT: /var/lib/footballai/runs
+      FOOTBALLAI_V2_QUEUE_ROOT: /var/lib/footballai/queue
+      FOOTBALLAI_QUEUE_BACKEND: local
+      FOOTBALLAI_OBJECT_STORAGE_BACKEND: local
+      FOOTBALLAI_DATABASE_BACKEND: local_manifest
+      FOOTBALLAI_V2_CORS_ORIGINS: "http://localhost:${FOOTBALLAI_FRONTEND_PORT:-8080},http://127.0.0.1:${FOOTBALLAI_FRONTEND_PORT:-8080}"
+      FOOTBALLAI_CODE_REVISION: "${FOOTBALLAI_CODE_REVISION:-0000000000000000000000000000000000000000}"
+      FOOTBALLAI_CODE_DIRTY: "${FOOTBALLAI_CODE_DIRTY:-0}"
+    volumes:
+      - footballai-runs:/var/lib/footballai/runs
+      - footballai-queue:/var/lib/footballai/queue
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  worker:
+    image: footballai-worker:local
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    environment:
+      FOOTBALLAI_ENVIRONMENT: local
+      FOOTBALLAI_LOG_LEVEL: "${FOOTBALLAI_LOG_LEVEL:-INFO}"
+      FOOTBALLAI_V2_RUN_ROOT: /var/lib/footballai/runs
+      FOOTBALLAI_V2_QUEUE_ROOT: /var/lib/footballai/queue
+      FOOTBALLAI_QUEUE_BACKEND: local
+      FOOTBALLAI_OBJECT_STORAGE_BACKEND: local
+      FOOTBALLAI_DATABASE_BACKEND: local_manifest
+      FOOTBALLAI_V1_COMPAT_MODEL_PATH: /models/yolov8m.pt
+      FOOTBALLAI_V1_COMPAT_DEVICE: "${FOOTBALLAI_V1_COMPAT_DEVICE:-cpu}"
+      FOOTBALLAI_WORKER_POLL_SECONDS: "${FOOTBALLAI_WORKER_POLL_SECONDS:-0.25}"
+      FOOTBALLAI_DEMO_STAGE_DELAY_SECONDS: "${FOOTBALLAI_DEMO_STAGE_DELAY_SECONDS:-0.12}"
+    volumes:
+      - footballai-runs:/var/lib/footballai/runs
+      - footballai-queue:/var/lib/footballai/queue
+      - ./.models:/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  footballai-runs:
+  footballai-queue:

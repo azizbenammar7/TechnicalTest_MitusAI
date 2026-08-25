@@ -11,7 +11,7 @@ from pathlib import Path
 
 from footballai_v2.contracts.v1 import AnalysisRunStatus, utc_now, validate_run_id
 from footballai_v2.execution.contracts import ExecutionJob
-from footballai_v2.storage import LocalAnalysisRunStore, RunNotFoundError
+from footballai_v2.storage import AnalysisRepository, RunNotFoundError
 
 
 class DuplicateJobError(FileExistsError):
@@ -77,6 +77,9 @@ class LocalFilesystemQueue:
         for source in sorted((self.root / "queued").glob("*.json")):
             try:
                 job = self._read(source)
+            except FileNotFoundError:
+                # Another worker won the atomic rename after this directory scan.
+                continue
             except QueueRecordError:
                 if source.exists():
                     self._move_raw(source, self.root / "failed" / source.name)
@@ -110,7 +113,7 @@ class LocalFilesystemQueue:
                     return True
         return False
 
-    def recover_abandoned(self, timeout_seconds: float, store: LocalAnalysisRunStore) -> int:
+    def recover_abandoned(self, timeout_seconds: float, store: AnalysisRepository) -> int:
         cutoff = utc_now() - timedelta(seconds=max(timeout_seconds, 1))
         recovered = 0
         for source in (self.root / "claimed").glob("*.json"):

@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import UUID4
 
 from footballai_v2.api.legacy_adapter import LegacyDataError, LegacyRunAdapter
@@ -18,6 +19,10 @@ from footballai_v2.api.models import (
     ArtifactListResponse,
     ArtifactView,
     AttemptLink,
+    DirectUploadAuthorization,
+    DirectUploadAuthorizeRequest,
+    DirectUploadAuthorizeResponse,
+    DirectUploadFinalizeRequest,
     HealthResponse,
     ManifestResponse,
     OperationResponse,
@@ -31,15 +36,34 @@ from footballai_v2.api.models import (
     RunListResponse,
     ProgressResponse,
     QueuedRunResponse,
+    ReadinessResponse,
     StageView,
     TeamSummaryResponse,
 )
-from footballai_v2.contracts.v1 import ANALYSIS_RUN_CONTRACT_VERSION, AnalysisRun, AnalysisRunStatus, InvalidStatusTransition
+from footballai_v2.contracts.v1 import (
+    ANALYSIS_RUN_CONTRACT_VERSION,
+    AnalysisRun,
+    AnalysisRunStatus,
+    DataOrigin,
+    InvalidStatusTransition,
+)
 from footballai_v2.execution.adapters import profile_catalog
-from footballai_v2.execution.cancellation import CancellationStore
 from footballai_v2.execution.coordinator import AnalysisCoordinator, ExecutionSettings, UploadValidationError
 from footballai_v2.execution.progress import active_stage, overall_progress
-from footballai_v2.storage import LocalAnalysisRunStore, ManifestConflictError, RunNotFoundError
+from footballai_v2.runtime_health import checks_ready
+from footballai_v2.runtime_readiness import build_readiness_probes
+from footballai_v2.storage import (
+    InvalidStorageObjectError,
+    ManifestConflictError,
+    RunNotFoundError,
+    StorageConflictError,
+    StorageError,
+    StorageIntegrityError,
+    StorageNotFoundError,
+    StorageProviderUnavailableError,
+)
+from footballai_v2.storage.ports import UploadAuthorizer
+from footballai_v2.storage.upload_service import DirectUploadService
 
 
 logger = logging.getLogger("footballai_v2.api")
@@ -86,18 +110,23 @@ def _public_manifest(run: AnalysisRun) -> dict[str, Any]:
     return payload
 
 
-def _validate_local_origins(origins: Sequence[str]) -> list[str]:
+def _validate_origins(origins: Sequence[str], environment: str) -> list[str]:
     validated = []
     for origin in origins:
         parsed = urlparse(origin)
+        local_origin = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
+        remote_origin = environment in {"staging", "production"} and parsed.scheme == "https"
         if (
-            parsed.scheme != "http"
-            or parsed.hostname not in {"localhost", "127.0.0.1"}
+            not (local_origin or remote_origin)
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
         ):
-            raise ValueError(f"CORS origin must be an HTTP localhost origin: {origin!r}")
+            raise ValueError(
+                f"CORS origin must be HTTP localhost for local use or HTTPS in staging/production: {origin!r}"
+            )
         validated.append(origin.rstrip("/"))
     return validated
 
@@ -108,19 +137,37 @@ def create_app(
     queue_root: str | Path | None = None,
     allowed_origins: Sequence[str] = ("http://localhost:5173",),
     settings: ExecutionSettings | None = None,
+    upload_service: DirectUploadService | None = None,
 ) -> FastAPI:
     """Create a local, read-oriented API bound to one configured run root."""
     execution_settings = settings or ExecutionSettings.from_environment(run_root, queue_root)
     coordinator = AnalysisCoordinator(execution_settings)
-    store = coordinator.store
-    cancellations = CancellationStore(store.root)
+    # The API depends only on the ports. It never assumes it shares a filesystem
+    # with the worker: lifecycle comes from the repository, artifact bytes from
+    # object storage. In local mode both resolve to the fused store; in split mode
+    # they are PostgreSQL and Blob respectively.
+    repository = coordinator.repository
+    object_storage = coordinator.object_storage
+    direct_upload = upload_service
+    if direct_upload is None and isinstance(object_storage, UploadAuthorizer):
+        direct_upload = DirectUploadService(
+            object_storage,
+            repository,
+            coordinator.queue,
+            max_upload_bytes=execution_settings.max_upload_bytes,
+            code_reference=coordinator.code_reference(),
+        )
+    # Bounded, cached readiness probes for the configured planes (built once).
+    readiness_probes = build_readiness_probes(execution_settings, repository, object_storage)
     app = FastAPI(
         title="FootballAi V2 local analysis API",
         version="1.0.0",
         description="Local upload, execution-control, and results API for versioned FootballAi analysis runs.",
     )
-    app.state.run_store = store
-    origins = _validate_local_origins(allowed_origins)
+    app.state.run_store = repository
+    app.state.object_storage = object_storage
+    app.state.direct_upload_service = direct_upload
+    origins = _validate_origins(allowed_origins, execution_settings.environment)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
@@ -128,6 +175,25 @@ def create_app(
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Accept", "Content-Type", "X-Request-ID"],
     )
+
+    @app.exception_handler(StorageError)
+    async def storage_error_handler(_request: Request, exc: StorageError) -> JSONResponse:
+        if isinstance(exc, StorageNotFoundError):
+            status, message = 404, "The requested storage object was not found."
+        elif isinstance(exc, StorageConflictError):
+            status, message = 409, "The storage object conflicts with existing immutable data."
+        elif isinstance(exc, StorageIntegrityError):
+            status, message = 422, "The storage object failed integrity verification."
+        elif isinstance(exc, InvalidStorageObjectError):
+            status, message = 422, "The uploaded object is invalid."
+        elif isinstance(exc, StorageProviderUnavailableError):
+            status, message = 503, "Object storage is temporarily unavailable."
+        else:
+            status, message = 503, "Object storage is temporarily unavailable."
+        return JSONResponse(
+            status_code=status,
+            content={"detail": {"error_code": exc.code, "message": message}},
+        )
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
@@ -149,13 +215,13 @@ def create_app(
 
     def load_run(run_id: UUID4) -> AnalysisRun:
         try:
-            return store.load(str(run_id))
+            return repository.load(str(run_id))
         except RunNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Analysis run not found") from exc
 
     def adapter(run: AnalysisRun) -> LegacyRunAdapter:
         try:
-            return LegacyRunAdapter(store, run)
+            return LegacyRunAdapter(object_storage, run)
         except LegacyDataError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -163,13 +229,120 @@ def create_app(
     def health() -> HealthResponse:
         return HealthResponse(
             status="ok",
-            service="footballai-v2-local-api",
+            service="footballai-api",
             contract_version=ANALYSIS_RUN_CONTRACT_VERSION,
+        )
+
+    @app.get("/api/ready", response_model=ReadinessResponse)
+    def readiness(response: Response) -> ReadinessResponse:
+        checks = {name: probe.status() for name, probe in readiness_probes.items()}
+        ready = checks_ready(checks)
+        if not ready:
+            response.status_code = 503
+        return ReadinessResponse(
+            status="ready" if ready else "not_ready",
+            service="footballai-api",
+            environment=execution_settings.environment,
+            checks=checks,
         )
 
     @app.get("/api/v1/pipeline-profiles", response_model=PipelineProfileListResponse, summary="List local execution profiles")
     def pipeline_profiles() -> PipelineProfileListResponse:
         return PipelineProfileListResponse(profiles=[PipelineProfile(**item) for item in profile_catalog(include_test=execution_settings.allow_test_profiles)])
+
+    def require_direct_upload() -> DirectUploadService:
+        if direct_upload is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "direct_upload_unavailable",
+                    "message": "Direct object-storage upload is unavailable in this deployment.",
+                },
+            )
+        return direct_upload
+
+    @app.post(
+        "/api/v1/uploads/authorize",
+        response_model=DirectUploadAuthorizeResponse,
+        summary="Authorize one bounded direct video upload",
+    )
+    def authorize_direct_upload(
+        request: DirectUploadAuthorizeRequest,
+    ) -> DirectUploadAuthorizeResponse:
+        authorized = require_direct_upload().authorize(content_type=request.content_type)
+        grant = authorized.grant
+        return DirectUploadAuthorizeResponse(
+            run_id=authorized.run_id,
+            upload=DirectUploadAuthorization(
+                method=grant.method,
+                url=grant.url,
+                headers=dict(grant.headers),
+                max_bytes=grant.max_bytes,
+                expires_at=grant.expires_at,
+                required_content_type=grant.required_content_type,
+            ),
+        )
+
+    @app.post(
+        "/api/v1/uploads/finalize",
+        response_model=QueuedRunResponse,
+        status_code=202,
+        summary="Verify a direct upload and enqueue an immutable attempt",
+    )
+    def finalize_direct_upload(request: DirectUploadFinalizeRequest) -> QueuedRunResponse:
+        match_name = request.match_name.strip()
+        if not match_name:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_metadata", "message": "Match name cannot be blank."},
+            )
+        profile = next(
+            (
+                item
+                for item in profile_catalog(include_test=execution_settings.allow_test_profiles)
+                if item["profile_id"] == request.pipeline_profile
+            ),
+            None,
+        )
+        if profile is None:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "unknown_profile", "message": "Unknown pipeline profile."},
+            )
+        if not profile["available"]:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "profile_unavailable", "message": "Selected pipeline profile is unavailable."},
+            )
+        try:
+            origin = DataOrigin(request.data_origin)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_origin", "message": "Invalid data origin."},
+            ) from exc
+        if origin is DataOrigin.LEGACY_V1:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_origin", "message": "Legacy origin is reserved for imported artifacts."},
+            )
+        run = require_direct_upload().finalize(
+            str(request.run_id),
+            profile=request.pipeline_profile,
+            data_origin=origin,
+            parameters={
+                "match_name": match_name,
+                "home_team": request.home_team.strip(),
+                "away_team": request.away_team.strip(),
+                "competition": request.competition.strip(),
+                "match_date": request.match_date.strip(),
+                "venue": request.venue.strip(),
+                "notes": request.notes.strip(),
+                "data_origin": origin.value,
+                "quality_warnings": list(profile["warnings"]),
+            },
+        )
+        return _queued_response(run)
 
     @app.post(
         "/api/v1/analyses", response_model=QueuedRunResponse, status_code=202,
@@ -202,7 +375,7 @@ def create_app(
     @app.get("/api/v1/runs", response_model=RunListResponse)
     def list_runs() -> RunListResponse:
         items = []
-        for run in store.list_runs():
+        for run in repository.list_runs():
             progress = (
                 sum(float(stage.progress_percent) for stage in run.stages) / len(run.stages)
                 if run.stages
@@ -236,7 +409,7 @@ def create_app(
             for item in sorted(
                 (
                     item
-                    for item in store.list_runs()
+                    for item in repository.list_runs()
                     if item.logical_analysis_id == run.logical_analysis_id
                 ),
                 key=lambda item: item.attempt_number,
@@ -276,11 +449,7 @@ def create_app(
     def progress(run_id: UUID4) -> ProgressResponse:
         run = load_run(run_id)
         updated = run.completed_at or next((stage.finished_at or stage.started_at for stage in reversed(run.stages) if stage.finished_at or stage.started_at), None) or run.created_at
-        can_clone = False
-        try:
-            store.input_path(run.run_id); can_clone = True
-        except (ManifestConflictError, RunNotFoundError):
-            pass
+        can_clone = object_storage.has_input(run.run_id)
         return ProgressResponse(
             run_id=run.run_id, logical_analysis_id=run.logical_analysis_id, attempt_number=run.attempt_number,
             status=run.status.value, overall_progress_percent=overall_progress(run), active_stage=active_stage(run),
@@ -297,9 +466,9 @@ def create_app(
             raise HTTPException(status_code=409, detail="Terminal analysis attempts cannot be cancelled")
         if run.status is AnalysisRunStatus.QUEUED:
             coordinator.queue.cancel(run.run_id)
-            store.save(run.cancel(reason="Cancelled before execution."))
+            repository.save(run.cancel(reason="Cancelled before execution."))
             return OperationResponse(run_id=run.run_id, status="cancelled", message="Queued analysis cancelled.")
-        cancellations.request(run.run_id)
+        repository.request_cancellation(run.run_id)
         return OperationResponse(run_id=run.run_id, status="running", message="Cancellation requested; the worker will stop at a safe checkpoint.")
 
     @app.post("/api/v1/runs/{run_id}/retry", response_model=QueuedRunResponse, status_code=202, summary="Create a new retry attempt")
@@ -340,7 +509,7 @@ def create_app(
                     sha256=item.sha256,
                     schema_version=item.schema_version,
                     integrity_state=(
-                        "verified" if store.artifact_integrity(run.run_id, item.artifact_id) else "invalid"
+                        "verified" if object_storage.artifact_integrity(run.run_id, item.artifact_id) else "invalid"
                     ),
                 )
                 for item in run.artifacts
@@ -370,3 +539,7 @@ def create_app(
 
 def _queued_response(run: AnalysisRun) -> QueuedRunResponse:
     return QueuedRunResponse(run_id=run.run_id, logical_analysis_id=run.logical_analysis_id, attempt_number=run.attempt_number, status=run.status.value, progress_url=f"/api/v1/runs/{run.run_id}/progress")
+    DirectUploadAuthorization,
+    DirectUploadAuthorizeRequest,
+    DirectUploadAuthorizeResponse,
+    DirectUploadFinalizeRequest,

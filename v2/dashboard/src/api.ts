@@ -1,6 +1,16 @@
 import { useEffect, useState } from 'react'
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+declare global {
+  interface Window {
+    __FOOTBALLAI_CONFIG__?: {
+      apiBase?: string | null
+      uploadMode?: 'multipart' | 'direct' | null
+    }
+  }
+}
+
+const API_BASE = window.__FOOTBALLAI_CONFIG__?.apiBase ?? import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+const UPLOAD_MODE = window.__FOOTBALLAI_CONFIG__?.uploadMode ?? 'multipart'
 
 export class ApiError extends Error {
   constructor(message: string, public status?: number) {
@@ -33,7 +43,25 @@ export async function apiPost<T>(path: string, body?: BodyInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-export function uploadAnalysis(form: FormData, onProgress: (percent: number) => void): Promise<{ run_id: string }> {
+interface QueuedRunResponse { run_id: string }
+
+interface DirectUploadAuthorization {
+  run_id: string
+  upload: {
+    method: string
+    url: string
+    headers: Record<string, string>
+    max_bytes: number
+    required_content_type: string
+  }
+}
+
+function formString(form: FormData, name: string): string {
+  const value = form.get(name)
+  return typeof value === 'string' ? value : ''
+}
+
+function multipartUpload(form: FormData, onProgress: (percent: number) => void): Promise<QueuedRunResponse> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest()
     request.open('POST', `${API_BASE}/api/v1/analyses`)
@@ -48,6 +76,56 @@ export function uploadAnalysis(form: FormData, onProgress: (percent: number) => 
     request.onerror = () => reject(new ApiError('The local API could not be reached.'))
     request.send(form)
   })
+}
+
+function putDirect(
+  file: File,
+  authorization: DirectUploadAuthorization['upload'],
+  onProgress: (percent: number) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    request.open(authorization.method, authorization.url)
+    for (const [name, value] of Object.entries(authorization.headers)) request.setRequestHeader(name, value)
+    request.upload.onprogress = (event) => event.lengthComputable && onProgress(Math.round(event.loaded / event.total * 100))
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) resolve()
+      else reject(new ApiError(`Object upload failed (${request.status}).`, request.status))
+    }
+    request.onerror = () => reject(new ApiError('The object storage upload could not be completed.'))
+    request.send(file)
+  })
+}
+
+async function directUpload(form: FormData, onProgress: (percent: number) => void): Promise<QueuedRunResponse> {
+  const file = form.get('video')
+  if (!(file instanceof File)) throw new ApiError('Choose a video before starting the analysis.')
+  if (!file.type) throw new ApiError('The selected video does not report a supported media type.')
+
+  const authorized = await apiPost<DirectUploadAuthorization>(
+    '/api/v1/uploads/authorize',
+    JSON.stringify({ content_type: file.type }),
+  )
+  if (file.size > authorized.upload.max_bytes) throw new ApiError('Video exceeds the configured upload limit.', 413)
+  await putDirect(file, authorized.upload, onProgress)
+  onProgress(100)
+
+  return apiPost<QueuedRunResponse>('/api/v1/uploads/finalize', JSON.stringify({
+    run_id: authorized.run_id,
+    match_name: formString(form, 'match_name'),
+    home_team: formString(form, 'home_team'),
+    away_team: formString(form, 'away_team'),
+    competition: formString(form, 'competition'),
+    match_date: formString(form, 'match_date'),
+    venue: formString(form, 'venue'),
+    notes: formString(form, 'notes'),
+    data_origin: formString(form, 'data_origin'),
+    pipeline_profile: formString(form, 'pipeline_profile'),
+  }))
+}
+
+export function uploadAnalysis(form: FormData, onProgress: (percent: number) => void): Promise<QueuedRunResponse> {
+  return UPLOAD_MODE === 'direct' ? directUpload(form, onProgress) : multipartUpload(form, onProgress)
 }
 
 export function useApi<T>(path: string | null) {
