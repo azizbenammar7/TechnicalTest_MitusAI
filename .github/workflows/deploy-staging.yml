@@ -75,7 +75,8 @@ jobs:
           if [[ -n "${{ inputs.image_sha }}" ]]; then
             SHA="${{ inputs.image_sha }}"
           else
-            SHA="$(tr -d '[:space:]' < .github/deploy-request/image_sha)"
+            # Line 1 is the SHA; any further lines (e.g. a re-trigger nonce) are ignored.
+            SHA="$(head -n1 .github/deploy-request/image_sha | tr -d '[:space:]')"
           fi
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::image_sha '$SHA' is not a 40-char lowercase Git SHA"; exit 1; }
           echo "IMAGE_SHA=$SHA" >> "$GITHUB_ENV"
@@ -100,10 +101,11 @@ jobs:
           az acr login --name "$ACR"
           for name in frontend api worker; do
             img="$ACR_LOGIN_SERVER/footballai-$name:$IMAGE_SHA"
-            docker buildx imagetools inspect "$img" > meta.txt 2>&1 || { echo "::error::$img not found in ACR"; cat meta.txt; exit 1; }
-            grep -q "linux/amd64" meta.txt || { echo "::error::$img is not linux/amd64"; cat meta.txt; exit 1; }
-            digest=$(grep -m1 -oE 'Digest:[[:space:]]*sha256:[0-9a-f]+' meta.txt | grep -oE 'sha256:[0-9a-f]+')
-            echo "footballai-$name: exists, linux/amd64, $digest"
+            plat=$(docker buildx imagetools inspect "$img" --format '{{.Image.OS}}/{{.Image.Architecture}}' 2>/dev/null) \
+              || { echo "::error::$img not found in ACR"; exit 1; }
+            [[ "$plat" == "linux/amd64" ]] || { echo "::error::$img is $plat, expected linux/amd64"; exit 1; }
+            digest=$(docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}' 2>/dev/null || echo "?")
+            echo "footballai-$name: exists, $plat, $digest"
           done
 
       - name: Ensure PostgreSQL is Ready (do not auto-start cost-bearing infra)
