@@ -42,11 +42,6 @@ resource "azurerm_container_app" "api" {
     value = local.database_url
   }
 
-  secret {
-    name  = "applicationinsights-connection-string"
-    value = azurerm_application_insights.staging.connection_string
-  }
-
   template {
     min_replicas = 0
     max_replicas = 1
@@ -72,9 +67,12 @@ resource "azurerm_container_app" "api" {
         }
       }
 
+      # Not a secret: with component local auth disabled, the connection
+      # string's instrumentation key cannot authenticate ingestion; it only
+      # provides endpoint discovery for the Entra-authenticated exporter.
       env {
-        name        = "APPLICATIONINSIGHTS_CONNECTION_STRING"
-        secret_name = "applicationinsights-connection-string"
+        name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+        value = azurerm_application_insights.staging.connection_string
       }
 
       liveness_probe {
@@ -207,11 +205,6 @@ resource "azurerm_container_app_job" "worker" {
     value = local.database_url
   }
 
-  secret {
-    name  = "applicationinsights-connection-string"
-    value = azurerm_application_insights.staging.connection_string
-  }
-
   event_trigger_config {
     parallelism              = 1
     replica_completion_count = 1
@@ -255,9 +248,11 @@ resource "azurerm_container_app_job" "worker" {
         }
       }
 
+      # Not a secret: see the API app. Local-auth-disabled component makes the
+      # instrumentation key non-authenticating; this is endpoint discovery only.
       env {
-        name        = "APPLICATIONINSIGHTS_CONNECTION_STRING"
-        secret_name = "applicationinsights-connection-string"
+        name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+        value = azurerm_application_insights.staging.connection_string
       }
     }
   }
@@ -289,11 +284,6 @@ resource "azurerm_container_app_job" "migration" {
   secret {
     name  = "database-url"
     value = local.database_url
-  }
-
-  secret {
-    name  = "applicationinsights-connection-string"
-    value = azurerm_application_insights.staging.connection_string
   }
 
   manual_trigger_config {
@@ -344,9 +334,11 @@ resource "azurerm_container_app_job" "migration" {
         value = "0.2"
       }
 
+      # Not a secret: see the API app. Local-auth-disabled component makes the
+      # instrumentation key non-authenticating; this is endpoint discovery only.
       env {
-        name        = "APPLICATIONINSIGHTS_CONNECTION_STRING"
-        secret_name = "applicationinsights-connection-string"
+        name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+        value = azurerm_application_insights.staging.connection_string
       }
     }
   }
