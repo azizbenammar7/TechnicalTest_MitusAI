@@ -111,7 +111,9 @@ jobs:
       - name: Ensure PostgreSQL is Ready (do not auto-start cost-bearing infra)
         run: |
           set -euo pipefail
-          read -r PG_NAME PG_STATE < <(az postgres flexible-server list -g "$RG" --query '[0].[name,state]' -o tsv)
+          PG_NAME=$(az postgres flexible-server list -g "$RG" --query '[0].name' -o tsv)
+          # `show` (GET) reliably returns `state`; the `list` projection can omit it.
+          PG_STATE=$(az postgres flexible-server show -g "$RG" -n "$PG_NAME" --query 'state' -o tsv)
           echo "PostgreSQL $PG_NAME state=$PG_STATE"
           if [[ "$PG_STATE" != "Ready" ]]; then
             echo "::error::PostgreSQL '$PG_NAME' is '$PG_STATE'. Start it deliberately before deploying:"
