@@ -1,4 +1,4 @@
-FROM python:3.13.11-slim-bookworm AS build
+FROM python:3.14.6-slim-bookworm AS build
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
@@ -23,7 +23,7 @@ RUN sed '/^torch==/d; /^torchvision==/d' requirements-v1-compat.txt > requiremen
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels . \
  && /opt/venv/bin/python -m pip install --no-cache-dir --no-index --no-compile --no-deps /wheels/*.whl
 
-FROM python:3.13.11-slim-bookworm AS runtime
+FROM python:3.14.6-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
