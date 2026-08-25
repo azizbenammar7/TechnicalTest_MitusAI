@@ -6,7 +6,7 @@ RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY v2/dashboard/ ./
 RUN npm run build
 
-FROM nginxinc/nginx-unprivileged:1.29.5-alpine3.23 AS runtime
+FROM nginxinc/nginx-unprivileged:1.31.2-alpine3.23 AS runtime
 
 RUN rm /etc/nginx/conf.d/default.conf
 COPY --chown=nginx:nginx docker/frontend.nginx.conf /etc/nginx/footballai-nginx.conf.template
