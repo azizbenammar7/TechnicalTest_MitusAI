@@ -8,11 +8,12 @@ COPY v2/src ./src
 COPY v2/requirements-api.txt ./requirements-api.txt
 COPY v2/requirements-postgres.txt ./requirements-postgres.txt
 COPY v2/requirements-azure.txt ./requirements-azure.txt
+COPY v2/requirements-observability.txt ./requirements-observability.txt
 # Toolchain + libpq headers so the psycopg-c wheel can compile against libpq.
 # Confined to the build stage; the runtime image only carries libpq itself.
 RUN apk add --no-cache gcc musl-dev python3-dev libpq-dev
 RUN python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
-      -r requirements-api.txt -r requirements-postgres.txt -r requirements-azure.txt \
+      -r requirements-api.txt -r requirements-postgres.txt -r requirements-azure.txt -r requirements-observability.txt \
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels . \
  && /opt/venv/bin/python -m pip install --no-cache-dir --no-index --no-compile --no-deps /wheels/*.whl
 
