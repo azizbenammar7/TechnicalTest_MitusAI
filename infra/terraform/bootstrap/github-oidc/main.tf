@@ -120,6 +120,35 @@ resource "azurerm_role_assignment" "plan_acr_pull" {
   principal_type       = "ServicePrincipal"
 }
 
+# `terraform plan` refreshes the Container Apps / Jobs, which carry a `secret`
+# block (the database-url secret), so the azurerm provider calls listSecrets.
+# `Reader` does not include that POST action. This custom role adds ONLY the two
+# listSecrets actions (reads are already covered by Reader) so the read-only
+# plan identity can refresh — no write/delete, no secret mutation, no IAM. This
+# is the least-privilege fix for a real 403 the plan hit; NOT an escalation.
+resource "azurerm_role_definition" "plan_listsecrets" {
+  name        = "FootballAI Plan Container Apps Secret Reader"
+  scope       = data.azurerm_resource_group.staging.id
+  description = "listSecrets on Container Apps/Jobs so the read-only Terraform plan identity can refresh workloads that carry a secret block."
+
+  permissions {
+    actions = [
+      "Microsoft.App/containerApps/listSecrets/action",
+      "Microsoft.App/jobs/listSecrets/action",
+    ]
+    not_actions = []
+  }
+
+  assignable_scopes = [data.azurerm_resource_group.staging.id]
+}
+
+resource "azurerm_role_assignment" "plan_listsecrets" {
+  scope              = data.azurerm_resource_group.staging.id
+  role_definition_id = azurerm_role_definition.plan_listsecrets.role_definition_resource_id
+  principal_id       = azurerm_user_assigned_identity.plan.principal_id
+  principal_type     = "ServicePrincipal"
+}
+
 # =============================================================================
 # DEPLOY identity — Terraform apply + migration job, scoped to the app RG only.
 # Contributor deliberately EXCLUDES Microsoft.Authorization/roleAssignments/write.
