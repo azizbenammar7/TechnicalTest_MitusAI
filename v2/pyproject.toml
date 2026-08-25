@@ -40,6 +40,9 @@ cloud = [
   "azure-servicebus==7.14.3",
   "azure-identity==1.25.3",
 ]
+observability = [
+  "azure-monitor-opentelemetry==1.8.9",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
