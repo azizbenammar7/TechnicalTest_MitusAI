@@ -19,12 +19,54 @@ describes the pre-apply design only; no P6 Azure change has been applied.
   `ContainerAppConsoleLogs_CL`, `ContainerAppSystemLogs_CL`, and
   `ContainerAppHTTPLogs_CL` did not exist, so this was neither an alternate
   table name nor ordinary ingestion delay.
-- Root cause: Terraform set `local_authentication_enabled = false` on the Log
-  Analytics workspace while the selected Container Apps destination ingests
-  with the workspace ID and shared key. P6 restores local authentication for
-  this legacy environment integration. Application Insights ingestion remains
-  Entra-authenticated through the existing workload managed identities.
-- PostgreSQL remained `Stopped`; this audit did not start it.
+- The workspace has `disableLocalAuth = true` and PostgreSQL remained
+  `Stopped` (public access `Disabled`); this audit did not start it.
+
+## Legacy logging diagnosis and remediation history
+
+This diagnosis is retained because it is the reason for the architecture, not
+because the workaround it first suggested was adopted.
+
+- **Original state.** Container Apps logs destination = `log-analytics`; Log
+  Analytics `disableLocalAuth = true`.
+- **Observed.** Zero Container Apps ingestion. No `ContainerApp*` tables were
+  ever created despite real app revisions and job executions.
+- **Root cause.** The legacy `log-analytics` destination ships console/system
+  logs with the **workspace shared key** through the Azure Monitor **HTTP Data
+  Collector API**. Disabling workspace local authentication rejects shared-key
+  writes, so ingestion fails silently — no error surface, no tables.
+- **First workaround considered (REJECTED).** Re-enable workspace local
+  authentication (`local_authentication_enabled = true`) so the shared-key path
+  works again.
+- **Why rejected.** That legacy Container Apps → Log Analytics path is built on
+  the Azure Monitor HTTP Data Collector API, which Microsoft is retiring;
+  shared-key ingestion support ends **2026-09-14**. Rebuilding the P6 design on
+  a path that is weeks from end-of-support, and re-exposing the workspace shared
+  key to do it, is the wrong direction.
+- **Chosen remediation.** Move the environment to the **Azure Monitor logs
+  destination** and route console/system logs to the same workspace with an
+  **Azure Monitor diagnostic setting**. Diagnostic-setting ingestion is
+  platform-authenticated, so it works with workspace local auth **disabled** and
+  needs no shared key. See **Logging destination decision** below for the full
+  Option A vs Option B comparison.
+
+### Logging destination decision (Option A vs Option B)
+
+| | Option A — rejected | Option B — chosen |
+|---|---|---|
+| ACA logs destination | `log-analytics` | `azure-monitor` |
+| Ingestion path | HTTP Data Collector API (shared key) | Diagnostic setting, platform-authenticated |
+| Workspace shared key | required, re-exposed | not required, never retrieved |
+| Workspace local auth | must be re-enabled (`false → true`) | stays disabled (`false`) |
+| Platform lifecycle | Data Collector API support ends 2026-09-14 | current, Microsoft-recommended |
+| Destination tables | `ContainerAppConsoleLogs_CL` (custom) | `ContainerAppConsoleLogs` (resource-specific) |
+
+Option B is correct for August 2026: it is the only option that both restores
+ingestion and keeps `disableLocalAuth = true`, and it does not build new work on
+an ingestion API that reaches end-of-support in weeks. Terraform confirms the
+switch is an in-place update of the managed environment (0 destroy, 0 replace);
+`logs_destination` and `log_analytics_workspace_id` are not ForceNew in
+azurerm 4.81.0.
 
 After apply, validate the logging fix with real workload activity and allow up
 to several minutes for first-table creation. Do not claim the incident closed
@@ -72,9 +114,17 @@ kept in logs and useful trace attributes, never in metric dimensions.
 `FOOTBALLAI_OTEL_MODE=disabled` is the local/test default. Staging uses
 `azure_monitor`, the workspace-based `appi-footballai-stg` connection string,
 and each workload's user-assigned identity with the narrow `Monitoring Metrics
-Publisher` role. Live Metrics, performance counters, and offline disk storage
-are disabled. Health/readiness URLs are excluded and parent-based 20% trace
-sampling bounds volume.
+Publisher` role scoped to the Application Insights component. Live Metrics,
+performance counters, and offline disk storage are disabled. Health/readiness
+URLs are excluded and parent-based 20% trace sampling bounds volume.
+
+The component has local authentication disabled, so the connection string's
+instrumentation key cannot authenticate ingestion — only the managed identity's
+Entra token can. The connection string therefore carries endpoint/resource
+discovery only, not a credential, and is passed to the workloads as a plain
+`APPLICATIONINSIGHTS_CONNECTION_STRING` environment variable rather than a
+Container Apps secret. This removes needless secret state and `listSecrets`
+surface. It is still never emitted to logs or span attributes.
 
 ## Metrics
 
@@ -138,8 +188,16 @@ validation.
 
 ## KQL queries
 
-Workspace-based Application Insights uses `App*` tables. Container Apps legacy
-environment logs use `_CL` tables after the workspace-authentication fix.
+Workspace-based Application Insights uses `App*` tables. Container Apps platform
+logs land in the **resource-specific** `ContainerAppConsoleLogs` and
+`ContainerAppSystemLogs` tables (no `_CL` suffix), because the diagnostic
+setting uses the `Dedicated` destination type.
+
+> **Legacy note.** The retired `log-analytics` destination wrote custom
+> `ContainerAppConsoleLogs_CL` / `ContainerAppSystemLogs_CL` tables (with `_s`
+> columns) through the shared-key Data Collector API. Those `_CL` tables are
+> **not** the target of this design and were never populated in staging. Only
+> use them if querying a historical workspace that still ran the legacy path.
 
 ### Find a run across structured logs
 
@@ -187,25 +245,31 @@ AppTraces
 
 ### Verify Container Apps console/system ingestion
 
+Console logs carry the application's newline-delimited JSON in the `Log` column,
+so `parse_json(Log)` exposes the structured fields:
+
 ```kusto
-ContainerAppConsoleLogs_CL
+ContainerAppConsoleLogs
 | where TimeGenerated > ago(1h)
-| extend payload=parse_json(Log_s)
-| project TimeGenerated, ContainerAppName_s, RevisionName_s, Stream_s,
-          event=tostring(payload.event), run_id=tostring(payload.run_id), Log_s
+| extend payload=parse_json(Log)
+| project TimeGenerated, ContainerAppName, RevisionName, Stream,
+          event=tostring(payload.event), run_id=tostring(payload.run_id), Log
 | order by TimeGenerated desc
 ```
 
 ```kusto
-ContainerAppSystemLogs_CL
+ContainerAppSystemLogs
 | where TimeGenerated > ago(1h)
-| project TimeGenerated, ContainerAppName_s, RevisionName_s, Reason_s, Log_s
+| project TimeGenerated, ContainerAppName, RevisionName, Reason, Log
 | order by TimeGenerated desc
 ```
 
-If either table is absent after apply and fresh activity, re-check environment
-destination/customer ID, workspace local-auth state, daily-cap status, and Azure
-resource health before adding any diagnostic setting or workspace.
+If either table is absent after apply and fresh activity, re-check the
+environment logs destination (`azure-monitor`), the diagnostic setting
+(`diag-cae-footballai-stg` targeting the environment with `Dedicated`
+destination type), the daily-cap status, and Azure resource health. Do **not**
+re-enable workspace local authentication: the diagnostic-setting path is
+platform-authenticated and does not use the workspace shared key.
 
 ## Cost and validation gates
 
@@ -217,6 +281,14 @@ resource health before adding any diagnostic setting or workspace.
   never emitted.
 - Five native metric alerts add negligible telemetry volume. No availability
   web test or duplicate platform-metric export is added.
-- `terraform apply` is forbidden until the reviewed plan reports zero destroys
-  and zero replacements and the operator explicitly approves the first P6
-  apply.
+- The environment diagnostic setting routes only `ContainerAppConsoleLogs` and
+  `ContainerAppSystemLogs` into the same capped workspace. `ContainerAppHTTPLogs`
+  and `AllMetrics` are deliberately not enabled: HTTP request telemetry already
+  arrives through Application Insights, and platform metrics are queryable and
+  alertable natively without exporting them. Retention stays 30 days and the
+  0.1 GB/day cap is unchanged.
+- A review-only plan (`-refresh=false`, non-authoritative — a live plan needs
+  PostgreSQL running) reports the environment switch and secret→env changes as
+  in-place: **0 destroy, 0 replace**. `terraform apply` remains forbidden until
+  an authoritative reviewed plan reports zero destroys and zero replacements and
+  the operator explicitly approves the first P6 apply.
