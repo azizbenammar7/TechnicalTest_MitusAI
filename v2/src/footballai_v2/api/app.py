@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -50,6 +52,8 @@ from footballai_v2.contracts.v1 import (
 from footballai_v2.execution.adapters import profile_catalog
 from footballai_v2.execution.coordinator import AnalysisCoordinator, ExecutionSettings, UploadValidationError
 from footballai_v2.execution.progress import active_stage, overall_progress
+from footballai_v2.logging_config import bind_log_context, log_event
+from footballai_v2.observability import record_metric
 from footballai_v2.runtime_health import checks_ready
 from footballai_v2.runtime_readiness import build_readiness_probes
 from footballai_v2.storage import (
@@ -67,6 +71,7 @@ from footballai_v2.storage.upload_service import DirectUploadService
 
 
 logger = logging.getLogger("footballai_v2.api")
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def _timestamp(value) -> str | None:
@@ -197,21 +202,32 @@ def create_app(
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
-        request_id = str(uuid.uuid4())
+        supplied_request_id = request.headers.get("X-Request-ID", "")
+        request_id = supplied_request_id if _REQUEST_ID.fullmatch(supplied_request_id) else str(uuid.uuid4())
         started = time.perf_counter()
-        response = await call_next(request)
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        response.headers["X-Request-ID"] = request_id
-        response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.2f}"
-        logger.info(
-            "request_complete request_id=%s method=%s path=%s status=%s elapsed_ms=%.2f",
-            request_id,
-            request.method,
-            request.url.path,
-            response.status_code,
-            elapsed_ms,
-        )
-        return response
+        with bind_log_context(request_id=request_id, code_revision=os.getenv("FOOTBALLAI_CODE_REVISION")):
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                log_event(
+                    logger, logging.ERROR, "api.request_failed", "API request failed",
+                    method=request.method, path=request.url.path, status="5xx",
+                    duration_ms=round(elapsed_ms, 2), error_type=type(exc).__name__, exc_info=True,
+                )
+                record_metric("api_request_duration", elapsed_ms / 1000, unit="s", service="api", environment=execution_settings.environment, status="5xx")
+                raise
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.2f}"
+            status_class = f"{response.status_code // 100}xx"
+            log_event(
+                logger, logging.INFO, "api.request_completed", "API request completed",
+                method=request.method, path=request.url.path, status=status_class,
+                duration_ms=round(elapsed_ms, 2),
+            )
+            record_metric("api_request_duration", elapsed_ms / 1000, unit="s", service="api", environment=execution_settings.environment, status=status_class)
+            return response
 
     def load_run(run_id: UUID4) -> AnalysisRun:
         try:

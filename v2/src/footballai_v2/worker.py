@@ -11,7 +11,8 @@ import time
 from footballai_v2 import composition
 from footballai_v2.execution.coordinator import ExecutionSettings
 from footballai_v2.execution.executor import AnalysisExecutor
-from footballai_v2.logging_config import configure_logging
+from footballai_v2.logging_config import bind_log_context, log_event
+from footballai_v2.observability import add_metric, configure_observability
 
 
 def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -32,7 +33,7 @@ def _enabled(name: str, default: bool = False) -> bool:
 
 
 def main() -> None:
-    configure_logging("footballai-worker")
+    configure_observability("footballai-worker")
     settings = ExecutionSettings.from_environment()
     # The worker is built from configured provider-neutral planes; it never
     # assumes a shared filesystem with the API. Local, split (PostgreSQL + Blob +
@@ -53,12 +54,9 @@ def main() -> None:
     queue.recover_abandoned(claim_timeout, repository)
     executor = AnalysisExecutor(repository, object_storage, stage_delay_seconds=delay)
     worker_logger = logging.getLogger("footballai_v2.worker")
-    worker_logger.info(
-        "worker_started worker_id=%s queue_backend=%s object_storage_backend=%s database_backend=%s",
-        worker_id,
-        settings.queue_backend,
-        settings.object_storage_backend,
-        settings.database_backend,
+    log_event(
+        worker_logger, logging.INFO, "worker.started", "Worker started",
+        worker_id=worker_id, status="ready",
     )
     while not stopped:
         job = queue.claim(worker_id)
@@ -66,13 +64,24 @@ def main() -> None:
             if run_once:
                 break
             time.sleep(poll); continue
-        status = executor.execute(job, worker_id)
-        if status.value in {"succeeded", "partial"}: queue.complete(job)
-        elif status.value == "cancelled": queue.cancel(job.run_id)
-        else: queue.fail(job)
+        with bind_log_context(
+            logical_analysis_id=job.logical_analysis_id, run_id=job.run_id,
+            attempt_number=job.attempt_number,
+            job_execution_id=os.getenv("CONTAINER_APP_JOB_EXECUTION_NAME"),
+            code_revision=os.getenv("FOOTBALLAI_CODE_REVISION"),
+        ):
+            log_event(worker_logger, logging.INFO, "worker.job_claimed", "Worker claimed analysis job", worker_id=worker_id, job_id=job.job_id, profile=job.pipeline_profile)
+            status = executor.execute(job, worker_id)
+            if status.value in {"succeeded", "partial"}: queue.complete(job)
+            elif status.value == "cancelled": queue.cancel(job.run_id)
+            else: queue.fail(job)
+            add_metric(
+                "worker_job_success" if status.value in {"succeeded", "partial"} else "worker_job_failure",
+                service="worker", environment=settings.environment, status=status.value,
+            )
         if run_once:
             break
-    worker_logger.info("worker_stopped worker_id=%s", worker_id)
+    log_event(worker_logger, logging.INFO, "worker.stopped", "Worker stopped", worker_id=worker_id, status="stopped")
 
 
 if __name__ == "__main__":

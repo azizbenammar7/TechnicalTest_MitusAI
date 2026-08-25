@@ -5,11 +5,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from footballai_v2.api import create_app
-from footballai_v2.logging_config import configure_logging
+from footballai_v2.observability import configure_observability
 
 
-configure_logging("footballai-api")
+# Azure Monitor's FastAPI auto-instrumentation must initialize before FastAPI is
+# imported. Local/test mode is a provider-neutral no-op apart from logging.
+configure_observability("footballai-api")
+
+from footballai_v2.api import create_app  # noqa: E402
 
 
 run_root = Path(os.environ.get("FOOTBALLAI_V2_RUN_ROOT", "data/runs"))

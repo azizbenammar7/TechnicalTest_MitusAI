@@ -16,6 +16,7 @@ attempt instead of creating a second one.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Mapping
@@ -30,6 +31,8 @@ from footballai_v2.contracts.v1 import (
     StageStatus,
 )
 from footballai_v2.execution.contracts import ExecutionJob
+from footballai_v2.logging_config import bind_log_context, log_event
+from footballai_v2.observability import span
 from footballai_v2.storage.local_analysis_runs import RunAlreadyExistsError
 from footballai_v2.storage.errors import InvalidStorageObjectError
 from footballai_v2.storage.ports import UploadGrant
@@ -40,6 +43,7 @@ VIDEO_CONTENT_TYPES: tuple[str, ...] = (
     "video/x-matroska",
     "video/webm",
 )
+logger = logging.getLogger("footballai_v2.api")
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +80,8 @@ class DirectUploadService:
             max_bytes=self._max_upload_bytes,
             expires_seconds=self._expires_seconds,
         )
+        with bind_log_context(run_id=run_id):
+            log_event(logger, logging.INFO, "upload.authorized", "Direct upload authorized")
         return AuthorizedUpload(run_id=run_id, grant=grant)
 
     def finalize(
@@ -86,11 +92,11 @@ class DirectUploadService:
         data_origin: DataOrigin = DataOrigin.REAL,
         parameters: Mapping[str, JsonValue] | None = None,
     ) -> AnalysisRun:
-        finalized = self._authorizer.finalize_upload(
-            run_id,
-            max_bytes=self._max_upload_bytes,
-            allowed_content_types=VIDEO_CONTENT_TYPES,
-        )
+        with span("upload.finalize", run_id=run_id, profile=profile):
+            finalized = self._authorizer.finalize_upload(
+                run_id, max_bytes=self._max_upload_bytes,
+                allowed_content_types=VIDEO_CONTENT_TYPES,
+            )
         run = AnalysisRun.new(
             run_id=run_id,
             data_origin=data_origin,
@@ -109,9 +115,9 @@ class DirectUploadService:
         except RunAlreadyExistsError:
             # At-least-once finalize: the attempt already exists; stay idempotent.
             return self._repository.load(run_id)
-        self._queue.enqueue(
-            ExecutionJob.new(run.run_id, run.logical_analysis_id, run.attempt_number, profile)
-        )
+        with bind_log_context(run_id=run.run_id, logical_analysis_id=run.logical_analysis_id, attempt_number=run.attempt_number):
+            self._queue.enqueue(ExecutionJob.new(run.run_id, run.logical_analysis_id, run.attempt_number, profile))
+            log_event(logger, logging.INFO, "analysis.queued", "Analysis created and queued", profile=profile, status="queued")
         return run
 
 
