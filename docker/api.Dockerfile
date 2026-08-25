@@ -1,4 +1,4 @@
-FROM python:3.13.11-alpine3.23 AS build
+FROM python:3.14.7-alpine3.23 AS build
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
@@ -16,7 +16,7 @@ RUN python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels . \
  && /opt/venv/bin/python -m pip install --no-cache-dir --no-index --no-compile --no-deps /wheels/*.whl
 
-FROM python:3.13.11-alpine3.23 AS runtime
+FROM python:3.14.7-alpine3.23 AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
