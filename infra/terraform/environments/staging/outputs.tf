@@ -11,11 +11,23 @@ output "acr_login_server" {
 }
 
 output "frontend_fqdn" {
-  value = var.deploy_workloads ? azurerm_container_app.frontend[0].latest_revision_fqdn : null
+  description = "Stable frontend Container App ingress FQDN."
+  value       = var.deploy_workloads ? azurerm_container_app.frontend[0].ingress[0].fqdn : null
+}
+
+output "frontend_latest_revision_fqdn" {
+  description = "Revision-specific FQDN for the frontend Container App's latest revision."
+  value       = var.deploy_workloads ? azurerm_container_app.frontend[0].latest_revision_fqdn : null
 }
 
 output "api_fqdn" {
-  value = var.deploy_workloads ? azurerm_container_app.api[0].latest_revision_fqdn : null
+  description = "Stable internal API Container App ingress FQDN."
+  value       = var.deploy_workloads ? azurerm_container_app.api[0].ingress[0].fqdn : null
+}
+
+output "api_latest_revision_fqdn" {
+  description = "Revision-specific FQDN for the API Container App's latest revision."
+  value       = var.deploy_workloads ? azurerm_container_app.api[0].latest_revision_fqdn : null
 }
 
 output "blob_account_name" {

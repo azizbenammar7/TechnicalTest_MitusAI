@@ -17,7 +17,7 @@ guarantee is structural.
 | Identity | GitHub environment | Azure role → scope |
 |---|---|---|
 | `id-footballai-gha-build`  | `staging-build` | `AcrPush` → ACR `footballaistg1a06f8` |
-| `id-footballai-gha-plan`   | `staging-plan`  | `Reader` → `rg-footballai-stg`; `Storage Blob Data Contributor` → `tfstate` container; `AcrPull` → ACR |
+| `id-footballai-gha-plan`   | `staging-plan`  | `Reader` + Container Apps/Jobs `listSecrets` custom actions → `rg-footballai-stg`; `Storage Blob Data Contributor` → `tfstate` container; `AcrPull` → ACR |
 | `id-footballai-gha-deploy` | `staging`       | `Contributor` → `rg-footballai-stg`; `Storage Blob Data Contributor` → `tfstate` container; `AcrPull` → ACR |
 
 `Contributor` deliberately **excludes** `Microsoft.Authorization/roleAssignments/write`.
@@ -25,6 +25,12 @@ A normal image-tag deploy leaves `rbac.tf` role assignments unchanged (no-op),
 so this is sufficient. If a plan ever shows an RBAC change, apply fails on that
 write — the intended **STOP** signal, never a reason to grant Owner / User
 Access Administrator.
+
+The plan identity's custom role contains only
+`Microsoft.App/containerApps/listSecrets/action` and
+`Microsoft.App/jobs/listSecrets/action`. AzureRM provider refresh invokes these
+for workloads with a Terraform `secret` block; the role grants no mutation,
+delete or IAM action.
 
 ## OIDC subject format
 

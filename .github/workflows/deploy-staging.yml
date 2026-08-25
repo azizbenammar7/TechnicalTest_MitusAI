@@ -10,7 +10,6 @@
 name: Deploy staging
 
 on:
-  # Steady-state trigger (works once this workflow is on the default branch).
   workflow_dispatch:
     inputs:
       image_sha:
@@ -22,19 +21,6 @@ on:
         required: false
         type: boolean
         default: false
-
-  # === TEMPORARY P5 VALIDATION ONLY ===========================================
-  # workflow_dispatch only registers from the default branch, so this push
-  # trigger lets the deploy PLAN be exercised from feat/p5-devsecops-cicd before
-  # merge. It is scoped to that one branch AND to a dedicated trigger file whose
-  # CONTENT carries the target image SHA (the pushed commit's own SHA is NOT the
-  # image tag). The required-reviewer gate on the `staging` environment still
-  # blocks the apply. REMOVE this whole push block (and .github/deploy-request/)
-  # at P5 close, leaving only workflow_dispatch on main.
-  push:
-    branches: ["feat/p5-devsecops-cicd"]
-    paths: [".github/deploy-request/image_sha"]
-  # ============================================================================
 
 permissions:
   contents: read
@@ -71,14 +57,7 @@ jobs:
         id: resolve
         run: |
           set -euo pipefail
-          # workflow_dispatch carries image_sha as an input; the TEMPORARY push
-          # trigger carries it in the trigger file's content.
-          if [[ -n "${{ inputs.image_sha }}" ]]; then
-            SHA="${{ inputs.image_sha }}"
-          else
-            # Line 1 is the SHA; any further lines (e.g. a re-trigger nonce) are ignored.
-            SHA="$(head -n1 .github/deploy-request/image_sha | tr -d '[:space:]')"
-          fi
+          SHA="${{ inputs.image_sha }}"
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::image_sha '$SHA' is not a 40-char lowercase Git SHA"; exit 1; }
           echo "IMAGE_SHA=$SHA" >> "$GITHUB_ENV"
           echo "image_sha=$SHA" >> "$GITHUB_OUTPUT"

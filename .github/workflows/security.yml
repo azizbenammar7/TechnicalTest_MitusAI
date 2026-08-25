@@ -7,7 +7,7 @@ name: Security
 on:
   pull_request:
   push:
-    branches: [main, "feat/p5-devsecops-cicd"]
+    branches: [main]
   schedule:
     - cron: "0 6 * * 1" # weekly Monday 06:00 UTC (catches newly-published advisories)
 

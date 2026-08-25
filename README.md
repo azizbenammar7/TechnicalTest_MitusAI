@@ -47,8 +47,7 @@ p1-up`; see
 `PostgreSQLAnalysisRepository` (control plane, emulator-validated against a
 PostgreSQL container), `AzureBlobObjectStorage` with a direct-upload boundary
 (data plane, emulator-validated against Azurite), and `AzureServiceBusQueue`
-(implemented; validated against a faithful fake broker — real-Azure validation
-pending). A fail-fast composition root selects backends via
+(implemented and subsequently validated in real Azure). A fail-fast composition root selects backends via
 `FOOTBALLAI_{DATABASE,OBJECT_STORAGE,QUEUE}_BACKEND`; the local adapters remain
 the default.
 
@@ -63,15 +62,22 @@ created and no Azure credit consumed. See
 [`docs/v2/production-cloud-adapters.md`](docs/v2/production-cloud-adapters.md)
 and run the emulator-backed suite with `make p2-db-up && make p2-test`.
 
-**P3 Azure discovery and the Terraform staging foundation are complete.** The
-selected low-cost France Central topology represents Blob Storage, Service Bus,
-private PostgreSQL, ACR, a VNet-integrated Container Apps environment, separate
-managed identities, frontend/API Container Apps and an event-driven worker Job.
-Terraform formatting, validation and no-refresh planning pass, but no Azure
-resources or images have been created. Workloads remain gated off pending P4
-immutable images and an explicitly approved apply. See
+**P3 Azure/Terraform and P4 real-Azure staging validation are complete.** The
+low-cost France Central topology provisions Blob Storage, Service Bus, private
+PostgreSQL, ACR, a VNet-integrated Container Apps environment, separate managed
+identities, frontend/API Container Apps and event-driven worker/migration Jobs.
+Immutable images, migration, readiness and the split execution path have been
+validated in the real staging environment. See
 [`docs/v2/azure-staging-architecture.md`](docs/v2/azure-staging-architecture.md)
 and [`docs/v2/terraform.md`](docs/v2/terraform.md).
+
+**P5 CI/CD and DevSecOps are complete and ready for review.** Pull requests run
+Python, split-plane integration, frontend, Terraform and security gates. Main
+builds immutable SHA-tagged images and publishes SBOMs through a secretless OIDC
+build identity. Staging deployment is manual and accepts an explicit image SHA,
+then separates safety-gated planning from reviewer-gated apply, migration and a
+stable-FQDN smoke. See
+[`docs/v2/devsecops-cicd.md`](docs/v2/devsecops-cicd.md).
 
 The remaining README is the preserved V1 technical-test documentation.
 
