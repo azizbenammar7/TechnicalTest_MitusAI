@@ -73,6 +73,7 @@ jobs:
             -r v2/requirements-api.txt \
             -r v2/requirements-postgres.txt \
             -r v2/requirements-azure.txt \
+            -r v2/requirements-observability.txt \
             -r v2/requirements-worker-core.txt
 
   npm-deps:
