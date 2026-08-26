@@ -1,10 +1,10 @@
-ultralytics>=8.2.0
+ultralytics>=8.4.126
 opencv-python-headless>=4.9.0
 pandas>=2.2.0
-numpy>=1.26.0
-pyarrow>=15.0.0
+numpy>=2.5.2
+pyarrow>=25.0.1
 streamlit>=1.33.0
 plotly>=5.20.0
 matplotlib>=3.8.0
-scipy>=1.13.0
-tqdm>=4.66.0
+scipy>=1.18.1
+tqdm>=4.70.0

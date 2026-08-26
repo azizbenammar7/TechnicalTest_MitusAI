@@ -15,6 +15,6 @@ pycparser==3.0
 requests==2.34.2
 certifi==2026.7.22
 urllib3==2.7.0
-charset-normalizer==3.4.9
-idna==3.18
+charset-normalizer==3.5.1
+idna==3.19
 six==1.17.0
