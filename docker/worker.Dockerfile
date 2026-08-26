@@ -9,6 +9,7 @@ COPY v2/requirements-worker-core.txt ./requirements-worker-core.txt
 COPY v2/requirements-v1-compat.txt ./requirements-v1-compat.txt
 COPY v2/requirements-postgres.txt ./requirements-postgres.txt
 COPY v2/requirements-azure.txt ./requirements-azure.txt
+COPY v2/requirements-observability.txt ./requirements-observability.txt
 # Toolchain + libpq headers so the psycopg-c wheel can compile against libpq.
 # Confined to the build stage; the runtime image only carries libpq5 itself.
 RUN apt-get update \
@@ -16,7 +17,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 RUN sed '/^torch==/d; /^torchvision==/d' requirements-v1-compat.txt > requirements-worker-v1.txt \
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
-      -r requirements-worker-core.txt -r requirements-postgres.txt -r requirements-azure.txt \
+      -r requirements-worker-core.txt -r requirements-postgres.txt -r requirements-azure.txt -r requirements-observability.txt \
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
       --index-url https://download.pytorch.org/whl/cpu torch==2.13.0 torchvision==0.28.0 \
  && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements-worker-v1.txt \

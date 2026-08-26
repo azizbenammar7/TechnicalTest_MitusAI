@@ -79,6 +79,13 @@ then separates safety-gated planning from reviewer-gated apply, migration and a
 stable-FQDN smoke. See
 [`docs/v2/devsecops-cicd.md`](docs/v2/devsecops-cicd.md).
 
+**P6 observability foundation is implemented but not yet applied to Azure.** It
+adds redacted structured logs, end-to-end run/trace correlation, bounded
+OpenTelemetry metrics/traces, workspace-based Application Insights, native
+metric alerts, and reproducible KQL/operator-view guidance. The required first
+Azure plan/apply approval gate remains in force. See
+[`docs/v2/observability.md`](docs/v2/observability.md).
+
 The remaining README is the preserved V1 technical-test documentation.
 
 End-to-end pipeline: detect & track players in a full 90-minute match →

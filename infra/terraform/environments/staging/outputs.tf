@@ -46,6 +46,11 @@ output "servicebus_queue" {
   value = azurerm_servicebus_queue.analysis.name
 }
 
+output "application_insights_name" {
+  description = "Workspace-based Application Insights component used for P6 application telemetry."
+  value       = azurerm_application_insights.staging.name
+}
+
 output "postgres_host" {
   value = azurerm_postgresql_flexible_server.staging.fqdn
 }

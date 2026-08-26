@@ -24,6 +24,8 @@ from dataclasses import replace
 from footballai_v2.contracts.v1 import AnalysisRunStatus, utc_now
 from footballai_v2.execution.contracts import ExecutionJob
 from footballai_v2.execution.queue.lock_renewal import LockRenewer
+from footballai_v2.logging_config import log_event
+from footballai_v2.observability import attach_trace_context, detach_trace_context, inject_trace_context, span
 from footballai_v2.storage.local_analysis_runs import RunNotFoundError
 
 logger = logging.getLogger("footballai_v2.worker")
@@ -60,7 +62,7 @@ class AzureServiceBusQueue:
         self._lock_max_lifetime = lock_max_lifetime_seconds
         self._sender = None
         self._receiver = None
-        self._inflight: dict[str, tuple[object, LockRenewer]] = {}
+        self._inflight: dict[str, tuple[object, LockRenewer, object | None]] = {}
 
     # -- lazy Azure resources ------------------------------------------------
 
@@ -79,16 +81,17 @@ class AzureServiceBusQueue:
     def enqueue(self, job: ExecutionJob) -> None:
         from azure.servicebus import ServiceBusMessage
 
-        message = ServiceBusMessage(
-            json.dumps(job.to_dict(), sort_keys=True),
-            application_properties={
-                "run_id": job.run_id,
-                "logical_analysis_id": job.logical_analysis_id,
-                "attempt_number": job.attempt_number,
-            },
-            message_id=job.job_id,
-        )
-        self._get_sender().send_messages(message)
+        trace_carrier: dict[str, str] = {}
+        inject_trace_context(trace_carrier)
+        properties = {
+            "run_id": job.run_id,
+            "logical_analysis_id": job.logical_analysis_id,
+            "attempt_number": job.attempt_number,
+            **trace_carrier,
+        }
+        message = ServiceBusMessage(json.dumps(job.to_dict(), sort_keys=True), application_properties=properties, message_id=job.job_id)
+        with span("queue.publish", **{"messaging.system": "servicebus", "messaging.destination.name": self._queue_name}):
+            self._get_sender().send_messages(message)
 
     def claim(self, worker_id: str) -> ExecutionJob | None:
         if not worker_id or len(worker_id) > 128:
@@ -111,7 +114,7 @@ class AzureServiceBusQueue:
             disposition = self._executability(job)
             if disposition == "drain":
                 receiver.complete_message(message)
-                logger.info("job_duplicate_drained run_id=%s", job.run_id)
+                log_event(logger, logging.INFO, "queue.duplicate_drained", "Duplicate terminal job message drained", run_id=job.run_id, job_id=job.job_id, queue=self._queue_name)
                 continue
             if disposition == "unknown":
                 self._dead_letter(receiver, message, "unknown_run", "no control-plane record")
@@ -122,7 +125,8 @@ class AzureServiceBusQueue:
                 max_lifetime_seconds=self._lock_max_lifetime,
                 name=f"renew-{job.run_id}",
             ).start()
-            self._inflight[job.job_id] = (message, renewer)
+            context_token = attach_trace_context(getattr(message, "application_properties", {}) or {})
+            self._inflight[job.job_id] = (message, renewer, context_token)
             return replace(job, claimed_at=utc_now(), worker_id=worker_id)
         return None
 
@@ -142,7 +146,7 @@ class AzureServiceBusQueue:
         # A queued Service Bus message cannot be selectively removed by property;
         # it is drained on a later claim once the run is terminal. Report that no
         # message was removed here.
-        logger.info("queue_cancel_delegated_to_control_plane run_id=%s", run_id)
+        log_event(logger, logging.INFO, "queue.cancel_delegated", "Queue cancellation delegated to control plane", run_id=run_id, queue=self._queue_name)
         return False
 
     def recover_abandoned(self, timeout_seconds: float, store) -> int:
@@ -151,8 +155,9 @@ class AzureServiceBusQueue:
         return 0
 
     def close(self) -> None:
-        for _message, renewer in self._inflight.values():
+        for _message, renewer, context_token in self._inflight.values():
             renewer.stop()
+            detach_trace_context(context_token)
         self._inflight.clear()
         for resource in (self._receiver, self._sender):
             if resource is not None:
@@ -169,13 +174,14 @@ class AzureServiceBusQueue:
         entry = self._inflight.pop(job.job_id, None)
         if entry is None:
             return
-        message, renewer = entry
+        message, renewer, context_token = entry
         renewer.stop()
         receiver = self._get_receiver()
         if dead_letter:
             receiver.dead_letter_message(message)
         else:
             receiver.complete_message(message)
+        detach_trace_context(context_token)
 
     def _executability(self, job: ExecutionJob) -> str:
         """Return 'run' (execute), 'drain' (already terminal), or 'unknown'."""
@@ -202,7 +208,7 @@ class AzureServiceBusQueue:
 
     @staticmethod
     def _dead_letter(receiver, message, reason: str, description: str) -> None:
-        logger.warning("job_dead_lettered reason=%s", reason)
+        log_event(logger, logging.WARNING, "queue.dead_lettered", "Job message dead-lettered", error_code=reason)
         receiver.dead_letter_message(message, reason=reason, error_description=description)
 
 

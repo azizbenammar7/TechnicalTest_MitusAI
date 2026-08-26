@@ -7,6 +7,7 @@ without real Azure. Real Service Bus validation is pending.
 
 from __future__ import annotations
 
+import json
 import uuid
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ import pytest
 
 from footballai_v2.contracts.v1 import AnalysisRunStatus
 from footballai_v2.execution.contracts import ExecutionJob
+from footballai_v2.execution.queue import azure_service_bus
 from footballai_v2.execution.queue.azure_service_bus import AzureServiceBusQueue
 from footballai_v2.storage.local_analysis_runs import RunNotFoundError
 from fakes.service_bus import FakeServiceBusBroker, FakeServiceBusClient, _StoredMessage
@@ -81,6 +83,30 @@ def test_executable_run_is_claimed_and_completed():
     assert claimed is not None and claimed.run_id == job.run_id
     queue.complete(claimed)
     assert broker.active_count() == 0
+
+
+def test_w3c_trace_context_uses_message_properties_without_changing_body(monkeypatch):
+    broker = FakeServiceBusBroker()
+    repo = FakeRepository()
+    job = make_job()
+    repo.set_status(job.run_id, AnalysisRunStatus.QUEUED)
+    detached = []
+    monkeypatch.setattr(
+        azure_service_bus,
+        "inject_trace_context",
+        lambda carrier: carrier.update({"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"}),
+    )
+    monkeypatch.setattr(azure_service_bus, "attach_trace_context", lambda carrier: carrier["traceparent"])
+    monkeypatch.setattr(azure_service_bus, "detach_trace_context", detached.append)
+    queue = _queue(broker, repo)
+
+    queue.enqueue(job)
+    assert broker.messages[0].application_properties["traceparent"].startswith("00-")
+    assert ExecutionJob.from_dict(json.loads(broker.messages[0].body)) == job
+    claimed = queue.claim("worker-1")
+    assert claimed is not None
+    queue.complete(claimed)
+    assert detached == [broker.messages[0].application_properties["traceparent"]]
 
 
 def test_over_delivered_message_is_dead_lettered():

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import Callable
@@ -22,6 +23,8 @@ from footballai_v2.contracts.v1 import (
 from footballai_v2.execution.adapters import DemoPipeline, V1CompatPipeline
 from footballai_v2.execution.contracts import ExecutionJob
 from footballai_v2.execution.errors import CancellationObserved, ExecutionFailure
+from footballai_v2.logging_config import bind_log_context, log_event
+from footballai_v2.observability import add_metric, record_metric, span
 from footballai_v2.storage.ports import AnalysisRepository, ObjectStorage
 
 
@@ -61,6 +64,8 @@ class AnalysisExecutor:
         duration = float(run.parameters.get("video_probe", {}).get("duration_seconds", 0)) if isinstance(run.parameters.get("video_probe"), dict) else 0
         payloads = None
         started = time.perf_counter()
+        environment = os.getenv("FOOTBALLAI_ENVIRONMENT", "local")
+        add_metric("analysis_started_total", service="worker", environment=environment, profile=job.pipeline_profile)
         try:
             for index, stage in enumerate(run.stages):
                 active_index = index
@@ -75,20 +80,31 @@ class AnalysisExecutor:
                     raise ExecutionFailure("test_stage_failure", "The test profile stopped at detection.")
                 running = replace(stage, status=StageStatus.RUNNING, progress_percent=10, started_at=stage.started_at or utc_now(), finished_at=None, error=None, message=f"{stage.stage_name.value.replace('_', ' ').title()} in progress")
                 run = run.with_stages((*run.stages[:index], running, *run.stages[index + 1:])); self.repository.save(run)
-                if job.pipeline_profile == "v1_compat" and stage.stage_name.value == "detection":
-                    payloads = self._build_artifacts(adapter, run, duration)
-                if self.stage_delay_seconds:
-                    time.sleep(self.stage_delay_seconds)
+                stage_started = time.perf_counter()
+                with bind_log_context(stage=stage.stage_name.value):
+                    log_event(logger, logging.INFO, "analysis.stage_started", "Analysis stage started", job_id=job.job_id, worker_id=worker_id, profile=job.pipeline_profile)
+                    with span("analysis.stage", stage=stage.stage_name.value, profile=job.pipeline_profile, run_id=job.run_id, logical_analysis_id=job.logical_analysis_id, attempt_number=job.attempt_number):
+                        if job.pipeline_profile == "v1_compat" and stage.stage_name.value == "detection":
+                            payloads = self._build_artifacts(adapter, run, duration)
+                        if self.stage_delay_seconds:
+                            time.sleep(self.stage_delay_seconds)
                 self._checkpoint(job.run_id)
                 frame_stage = stage.stage_name.value in {"detection", "tracking"}
                 finished = replace(running, status=StageStatus.SUCCEEDED, progress_percent=100, finished_at=utc_now(), performance_metrics={"job_id": job.job_id, "run_id": job.run_id, "logical_analysis_id": job.logical_analysis_id, "attempt_number": job.attempt_number, "worker_id": worker_id, "stage": stage.stage_name.value, "status": "succeeded", "duration_seconds": round(self.stage_delay_seconds, 3), "frames_processed": 1 if frame_stage else 0, "processing_fps": round(1 / self.stage_delay_seconds, 2) if frame_stage and self.stage_delay_seconds else 0, "input_count": 1, "output_count": 1, "error_code": None}, message=f"{stage.stage_name.value.replace('_', ' ').title()} completed")
                 run = run.with_stages((*run.stages[:index], finished, *run.stages[index + 1:])); self.repository.save(run)
+                stage_duration = time.perf_counter() - stage_started
+                with bind_log_context(stage=stage.stage_name.value):
+                    log_event(logger, logging.INFO, "analysis.stage_completed", "Analysis stage completed", status="succeeded", duration_ms=round(stage_duration * 1000, 2))
+                record_metric("stage_duration_seconds", stage_duration, unit="s", service="worker", environment=environment, status="succeeded", stage=stage.stage_name.value)
             if payloads is None:
-                payloads = self._build_artifacts(adapter, run, duration)
+                with span("analysis.pipeline", profile=job.pipeline_profile, run_id=job.run_id, logical_analysis_id=job.logical_analysis_id, attempt_number=job.attempt_number):
+                    payloads = self._build_artifacts(adapter, run, duration)
             category_by_id = {"team-summary": ArtifactCategory.SUMMARY, "track-summary": ArtifactCategory.TRACKS, "track-detail": ArtifactCategory.TRACKS, "workload-advisory": ArtifactCategory.WORKLOAD_ADVISORY, "analysis-diagnostics": ArtifactCategory.OTHER}
             schema_by_id = {key: value["schema"] for key, value in payloads.items()}
-            for artifact_id, payload in payloads.items():
-                artifacts.append(self.object_storage.write_artifact(run.run_id, artifact_id=artifact_id, name=artifact_id.replace("-", " ").title(), category=category_by_id[artifact_id], relative_path=f"artifacts/{artifact_id}.json", content=(json.dumps(payload, indent=2, sort_keys=True) + "\n").encode(), media_type="application/json", schema_version=schema_by_id[artifact_id]))
+            with span("artifact.publish", artifact_count=len(payloads) + 2, run_id=job.run_id, logical_analysis_id=job.logical_analysis_id, attempt_number=job.attempt_number):
+                for artifact_id, payload in payloads.items():
+                    artifacts.append(self.object_storage.write_artifact(run.run_id, artifact_id=artifact_id, name=artifact_id.replace("-", " ").title(), category=category_by_id[artifact_id], relative_path=f"artifacts/{artifact_id}.json", content=(json.dumps(payload, indent=2, sort_keys=True) + "\n").encode(), media_type="application/json", schema_version=schema_by_id[artifact_id]))
+                    log_event(logger, logging.INFO, "artifact.published", "Analysis artifact published", artifact_id=artifact_id)
             # Compatibility aliases let the preserved dashboard adapter read the stable generated schema.
             summary_alias = self.object_storage.write_artifact(run.run_id, artifact_id="legacy-player-summary", name="Dashboard track summary", category=ArtifactCategory.SUMMARY, relative_path="artifacts/dashboard-track-summary.json", content=(json.dumps(payloads["track-summary"], sort_keys=True) + "\n").encode(), media_type="application/json", schema_version="footballai.track-summary/v1")
             advisory_alias_payload = payloads["workload-advisory"]["tracks"]
@@ -109,7 +125,10 @@ class AnalysisExecutor:
             else:
                 run = current.succeed(artifacts, stages=current.stages)
             self.repository.save(run)
-            logger.info("job_complete job_id=%s run_id=%s logical_analysis_id=%s attempt_number=%s worker_id=%s status=succeeded duration_seconds=%.3f", job.job_id, job.run_id, job.logical_analysis_id, job.attempt_number, worker_id, time.perf_counter() - started)
+            elapsed = time.perf_counter() - started
+            log_event(logger, logging.INFO, "analysis.completed", "Analysis completed", job_id=job.job_id, worker_id=worker_id, status=run.status.value, profile=job.pipeline_profile, duration_ms=round(elapsed * 1000, 2))
+            add_metric("analysis_succeeded_total", service="worker", environment=environment, profile=job.pipeline_profile)
+            record_metric("analysis_duration_seconds", elapsed, unit="s", service="worker", environment=environment, status=run.status.value, profile=job.pipeline_profile)
             return run.status
         except CancellationObserved:
             current = self.repository.load(job.run_id)
@@ -117,6 +136,10 @@ class AnalysisExecutor:
             if active_index >= 0 and stages[active_index].status is StageStatus.RUNNING:
                 stages[active_index] = replace(stages[active_index], status=StageStatus.CANCELLED, finished_at=utc_now(), message="Cancelled at a safe checkpoint")
             self.repository.save(current.cancel(reason="Cancellation requested by user.", stages=stages))
+            elapsed = time.perf_counter() - started
+            log_event(logger, logging.INFO, "analysis.cancelled", "Analysis cancelled", job_id=job.job_id, worker_id=worker_id, status="cancelled", duration_ms=round(elapsed * 1000, 2))
+            add_metric("analysis_cancelled_total", service="worker", environment=environment, profile=job.pipeline_profile)
+            record_metric("analysis_duration_seconds", elapsed, unit="s", service="worker", environment=environment, status="cancelled", profile=job.pipeline_profile)
             return AnalysisRunStatus.CANCELLED
         except Exception as exc:
             current = self.repository.load(job.run_id)
@@ -132,7 +155,11 @@ class AnalysisExecutor:
                     stages[active_index] = replace(stage, status=StageStatus.FAILED, finished_at=utc_now(), error=error, message=message)
             failure = StructuredError(code, message, True, utc_now(), {"stage": stages[active_index].stage_name.value if active_index >= 0 else "ingestion"})
             self.repository.save(current.fail(failure, stages=stages))
-            logger.error("job_failed job_id=%s run_id=%s logical_analysis_id=%s attempt_number=%s worker_id=%s stage=%s status=failed duration_seconds=%.3f frames_processed=0 processing_fps=0 input_count=1 output_count=0 error_code=%s", job.job_id, job.run_id, job.logical_analysis_id, job.attempt_number, worker_id, stages[active_index].stage_name.value if active_index >= 0 else "ingestion", time.perf_counter() - started, code)
+            elapsed = time.perf_counter() - started
+            failed_stage = stages[active_index].stage_name.value if active_index >= 0 else "ingestion"
+            log_event(logger, logging.ERROR, "analysis.failed", "Analysis failed safely", job_id=job.job_id, worker_id=worker_id, stage=failed_stage, status="failed", duration_ms=round(elapsed * 1000, 2), error_type=type(exc).__name__, error_code=code, exc_info=True)
+            add_metric("analysis_failed_total", service="worker", environment=environment, profile=job.pipeline_profile)
+            record_metric("analysis_duration_seconds", elapsed, unit="s", service="worker", environment=environment, status="failed", profile=job.pipeline_profile)
             return AnalysisRunStatus.FAILED
 
     def _build_artifacts(self, adapter, run: AnalysisRun, duration: float) -> dict[str, dict]:

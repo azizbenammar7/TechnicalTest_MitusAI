@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -17,10 +18,12 @@ from footballai_v2.contracts.v1 import (
 from footballai_v2.execution.adapters import profile_catalog
 from footballai_v2.execution.adapters.v1_compat_runtime import check_v1_compat_readiness
 from footballai_v2.execution.contracts import ExecutionJob
+from footballai_v2.logging_config import bind_log_context, log_event
 
 
 MEDIA_TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".webm": "video/webm"}
 CONTAINERS = {".mp4": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}, ".mov": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}, ".mkv": {"matroska", "webm"}, ".webm": {"matroska", "webm"}}
+logger = logging.getLogger("footballai_v2.api")
 
 
 class UploadValidationError(ValueError):
@@ -189,7 +192,9 @@ class AnalysisCoordinator:
             # put_input_file copies bytes into object storage; the coordinator
             # keeps ownership of the scratch file and removes it in the finally.
             self.object_storage.put_input_file(run.run_id, temporary, extension=extension, content_type=MEDIA_TYPES[extension])
-            self.queue.enqueue(ExecutionJob.new(run.run_id, run.logical_analysis_id, run.attempt_number, profile))
+            with bind_log_context(run_id=run.run_id, logical_analysis_id=run.logical_analysis_id, attempt_number=run.attempt_number):
+                self.queue.enqueue(ExecutionJob.new(run.run_id, run.logical_analysis_id, run.attempt_number, profile))
+                log_event(logger, logging.INFO, "analysis.queued", "Analysis created and queued", profile=profile, status="queued")
         except Exception:
             if not run.status.is_terminal:
                 from footballai_v2.contracts.v1 import StructuredError, utc_now
@@ -206,7 +211,9 @@ class AnalysisCoordinator:
         self.repository.create(retry)
         try:
             self.object_storage.copy_input(previous.run_id, retry.run_id)
-            self.queue.enqueue(ExecutionJob.new(retry.run_id, retry.logical_analysis_id, retry.attempt_number, profile))
+            with bind_log_context(run_id=retry.run_id, logical_analysis_id=retry.logical_analysis_id, attempt_number=retry.attempt_number):
+                self.queue.enqueue(ExecutionJob.new(retry.run_id, retry.logical_analysis_id, retry.attempt_number, profile))
+                log_event(logger, logging.INFO, "analysis.retry_queued", "Analysis retry queued", profile=profile, status="queued")
         except Exception:
             self.repository.save(retry.fail(StructuredError("input_copy_failed", "The source input could not be copied safely.", False, utc_now())))
             raise
@@ -219,7 +226,9 @@ class AnalysisCoordinator:
         self.repository.create(clone)
         try:
             self.object_storage.copy_input(previous.run_id, clone.run_id)
-            self.queue.enqueue(ExecutionJob.new(clone.run_id, clone.logical_analysis_id, 1, profile))
+            with bind_log_context(run_id=clone.run_id, logical_analysis_id=clone.logical_analysis_id, attempt_number=1):
+                self.queue.enqueue(ExecutionJob.new(clone.run_id, clone.logical_analysis_id, 1, profile))
+                log_event(logger, logging.INFO, "analysis.rerun_queued", "Analysis rerun queued", profile=profile, status="queued")
         except Exception:
             self.repository.save(clone.fail(StructuredError("input_copy_failed", "The source input could not be copied safely.", False, utc_now())))
             raise

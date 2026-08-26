@@ -13,6 +13,9 @@ locals {
     FOOTBALLAI_CODE_REVISION          = var.image_tag
     FOOTBALLAI_CODE_DIRTY             = "0"
     FOOTBALLAI_LOG_LEVEL              = "INFO"
+    FOOTBALLAI_LOG_FORMAT             = "json"
+    FOOTBALLAI_OTEL_MODE              = "azure_monitor"
+    FOOTBALLAI_TRACE_SAMPLE_RATIO     = "0.2"
   }
 }
 
@@ -64,6 +67,14 @@ resource "azurerm_container_app" "api" {
         }
       }
 
+      # Not a secret: with component local auth disabled, the connection
+      # string's instrumentation key cannot authenticate ingestion; it only
+      # provides endpoint discovery for the Entra-authenticated exporter.
+      env {
+        name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+        value = azurerm_application_insights.staging.connection_string
+      }
+
       liveness_probe {
         transport = "HTTP"
         port      = 8000
@@ -89,7 +100,7 @@ resource "azurerm_container_app" "api" {
     }
   }
 
-  depends_on = [azurerm_role_assignment.api]
+  depends_on = [azurerm_role_assignment.api, azurerm_role_assignment.application_insights_api]
   tags       = var.tags
 }
 
@@ -134,6 +145,11 @@ resource "azurerm_container_app" "frontend" {
       env {
         name  = "FOOTBALLAI_FRONTEND_UPLOAD_MODE"
         value = "direct"
+      }
+
+      env {
+        name  = "FOOTBALLAI_ENVIRONMENT"
+        value = "staging"
       }
 
       env {
@@ -231,10 +247,17 @@ resource "azurerm_container_app_job" "worker" {
           secret_name = env.key == "FOOTBALLAI_DATABASE_URL" ? "database-url" : null
         }
       }
+
+      # Not a secret: see the API app. Local-auth-disabled component makes the
+      # instrumentation key non-authenticating; this is endpoint discovery only.
+      env {
+        name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+        value = azurerm_application_insights.staging.connection_string
+      }
     }
   }
 
-  depends_on = [azurerm_role_assignment.worker]
+  depends_on = [azurerm_role_assignment.worker, azurerm_role_assignment.application_insights_worker]
   tags       = var.tags
 }
 
@@ -274,16 +297,52 @@ resource "azurerm_container_app_job" "migration" {
       image   = "${azurerm_container_registry.staging.login_server}/footballai-api:${var.image_tag}"
       cpu     = 0.25
       memory  = "0.5Gi"
-      command = ["python", "-m", "alembic"]
-      args    = ["-c", "/opt/footballai/alembic.ini", "upgrade", "head"]
+      command = ["python", "-m", "footballai_v2.migration"]
 
       env {
         name        = "FOOTBALLAI_DATABASE_URL"
         secret_name = "database-url"
       }
+
+      env {
+        name  = "AZURE_CLIENT_ID"
+        value = azurerm_user_assigned_identity.api.client_id
+      }
+
+      env {
+        name  = "FOOTBALLAI_ENVIRONMENT"
+        value = "staging"
+      }
+
+      env {
+        name  = "FOOTBALLAI_CODE_REVISION"
+        value = var.image_tag
+      }
+
+      env {
+        name  = "FOOTBALLAI_LOG_FORMAT"
+        value = "json"
+      }
+
+      env {
+        name  = "FOOTBALLAI_OTEL_MODE"
+        value = "azure_monitor"
+      }
+
+      env {
+        name  = "FOOTBALLAI_TRACE_SAMPLE_RATIO"
+        value = "0.2"
+      }
+
+      # Not a secret: see the API app. Local-auth-disabled component makes the
+      # instrumentation key non-authenticating; this is endpoint discovery only.
+      env {
+        name  = "APPLICATIONINSIGHTS_CONNECTION_STRING"
+        value = azurerm_application_insights.staging.connection_string
+      }
     }
   }
 
-  depends_on = [azurerm_role_assignment.api]
+  depends_on = [azurerm_role_assignment.api, azurerm_role_assignment.application_insights_api]
   tags       = var.tags
 }

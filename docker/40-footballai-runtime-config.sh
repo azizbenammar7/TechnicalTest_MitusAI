@@ -5,6 +5,7 @@ api_base="${FOOTBALLAI_FRONTEND_API_BASE:-}"
 api_upstream="${FOOTBALLAI_API_UPSTREAM:-http://api:8000}"
 upload_mode="${FOOTBALLAI_FRONTEND_UPLOAD_MODE:-multipart}"
 blob_connect_src="${FOOTBALLAI_BLOB_CONNECT_SRC:-}"
+environment="${FOOTBALLAI_ENVIRONMENT:-local}"
 if [ -n "$api_base" ] \
   && ! printf '%s\n' "$api_base" | grep -Eq '^http://(localhost|127[.]0[.]0[.]1):8000$'; then
   echo "FOOTBALLAI_FRONTEND_API_BASE must be blank (same-origin) or a local API URL on port 8000." >&2
@@ -33,10 +34,16 @@ if [ "$upload_mode" = "direct" ] && [ -z "$blob_connect_src" ]; then
   exit 2
 fi
 
+if ! printf '%s\n' "$environment" | grep -Eq '^(local|staging|production|test)$'; then
+  echo "FOOTBALLAI_ENVIRONMENT must be local, staging, production, or test." >&2
+  exit 2
+fi
+
 printf 'window.__FOOTBALLAI_CONFIG__ = { apiBase: "%s", uploadMode: "%s" };\n' "$api_base" "$upload_mode" \
   > /tmp/footballai-config.js
 
 sed -e "s|__FOOTBALLAI_API_UPSTREAM__|$api_upstream|g" \
   -e "s|__FOOTBALLAI_BLOB_CONNECT_SRC__|$blob_connect_src|g" \
+  -e "s|__FOOTBALLAI_ENVIRONMENT__|$environment|g" \
   /etc/nginx/footballai-nginx.conf.template \
   > /tmp/footballai-nginx.conf

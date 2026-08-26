@@ -36,12 +36,18 @@ resource "azurerm_container_registry" "staging" {
 }
 
 resource "azurerm_log_analytics_workspace" "staging" {
-  name                         = "log-${local.name_prefix}"
-  location                     = azurerm_resource_group.staging.location
-  resource_group_name          = azurerm_resource_group.staging.name
-  sku                          = "PerGB2018"
-  retention_in_days            = 30
-  daily_quota_gb               = 0.1
+  name                = "log-${local.name_prefix}"
+  location            = azurerm_resource_group.staging.location
+  resource_group_name = azurerm_resource_group.staging.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+  daily_quota_gb      = 0.1
+  # Local (shared-key) auth stays disabled. Every writer into this workspace is
+  # Entra-authenticated: Application Insights export uses each workload's
+  # managed identity, and Container Apps platform logs arrive through Azure
+  # Monitor diagnostic settings (container_environment.tf / observability.tf),
+  # not the legacy shared-key Data Collector path. No writer needs the
+  # workspace shared key, so none is retrieved or stored in Terraform.
   local_authentication_enabled = false
   tags                         = var.tags
 }
