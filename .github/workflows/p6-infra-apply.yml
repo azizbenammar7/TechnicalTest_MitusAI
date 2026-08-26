@@ -1,0 +1,260 @@
+# =============================================================================
+# TEMPORARY P6 REVIEWED INFRASTRUCTURE APPLY
+# REMOVE AFTER P6 STAGING VALIDATION
+# =============================================================================
+#
+# The steady-state `deploy-staging.yml` + `plan_policy.py` correctly REFUSE the
+# P6 observability rollout, because P6 deliberately changes foundation
+# resources (Application Insights, a diagnostic setting, five metric alerts, two
+# narrow role assignments, and the Container Apps environment) alongside the
+# four workloads. This ONE-TIME workflow authorizes EXACTLY that reviewed plan —
+# and nothing else — so the P6 infrastructure can be applied once, under a real
+# human approval boundary, without weakening the generic deploy policy.
+#
+#   plan  (staging-plan env, Reader plan identity)  -> sanitized safety-checked
+#         plan, exact P6 allowlist, 9/5/0/0, reviewed-hash match
+#     |   REQUIRED reviewer approval on the `staging` environment (manual, UI)
+#   apply (staging env, deploy identity) -> fresh re-plan, same policy, same
+#         reviewed hash + equal to the approved plan, apply, migrate, smoke
+#
+# Dispatch only. No push, no PR, no schedule, no workflow_run. Delete this file
+# once P6 staging is validated.
+#
+# -----------------------------------------------------------------------------
+# WHY GIT PROVENANCE IS A DISPATCH INPUT, NOT A HARD-CODED SHA
+# -----------------------------------------------------------------------------
+# A tracked workflow cannot reliably hard-code the Git SHA of the commit that
+# contains that same workflow: editing the hard-coded value produces a NEW
+# commit with a NEW SHA, so the pin can never match its own commit. Pinning that
+# way is self-referential and unsatisfiable.
+#
+# We therefore keep two DISTINCT provenance facts separate:
+#
+#   * release_sha    — the Git commit provenance, supplied as a validated
+#                      dispatch input (strict 40-hex), checked out EXACTLY, and
+#                      re-verified with `git rev-parse HEAD == release_sha`. The
+#                      branch name is never trusted after checkout, and there is
+#                      no default (an operator must name the exact release).
+#   * P6_REVIEWED_HASH — the reviewed Terraform RESOURCE/ACTION contract, a
+#                      SHA-256 over the canonical sanitized plan. This is fixed
+#                      in-file because it describes the plan, not the commit.
+#
+# release_sha != P6_REVIEWED_HASH. This separation is intentional and is the
+# opposite of a weakening: commit provenance stays exact and auditable while the
+# plan contract stays independently pinned.
+name: "TEMP P6 reviewed infra apply"
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: "Exact 40-char Git SHA of the P6 release commit (images must already exist in ACR at this tag)"
+        required: true
+        type: string
+      run_apply:
+        description: "Run the approval-gated APPLY job. Leave FALSE for a plan-only authoritative run."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Serialize against the steady-state staging deploy; never cancel an in-flight
+# terraform apply.
+concurrency:
+  group: footballai-staging-deploy
+  cancel-in-progress: false
+
+env:
+  TF_ROOT: infra/terraform/environments/staging
+  RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  ACR: ${{ vars.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+  MIGRATION_JOB: caj-footballai-stg-db-migrate
+  # Reviewed Terraform resource/action contract (SHA-256 over the canonical
+  # sanitized plan). NOT a Git SHA — see the header note.
+  P6_REVIEWED_HASH: 3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d
+
+jobs:
+  plan:
+    name: P6 plan (safety-gated)
+    runs-on: ubuntu-latest
+    environment: staging-plan # OIDC plan identity (Reader + state + AcrPull)
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      summary_hash: ${{ steps.policy.outputs.summary_hash }}
+    steps:
+      - name: Validate release_sha is a full 40-hex Git SHA
+        run: |
+          set -euo pipefail
+          SHA="${{ inputs.release_sha }}"
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::release_sha '$SHA' is not a 40-char lowercase Git SHA"; exit 1; }
+          echo "Release provenance SHA: $SHA"
+
+      - name: Check out EXACTLY the release commit (never trust a branch name)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_sha }}
+
+      - name: Prove the checkout is the requested release commit
+        run: |
+          set -euo pipefail
+          head=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
+          [[ "$head" == "${{ inputs.release_sha }}" ]] \
+            || { echo "::error::checked-out HEAD $head != release_sha ${{ inputs.release_sha }}"; exit 1; }
+          echo "HEAD confirmed at ${{ inputs.release_sha }}"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Azure login via OIDC (plan identity)
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify the three SHA-tagged images exist and are linux/amd64
+        run: |
+          set -euo pipefail
+          SHA="${{ inputs.release_sha }}"
+          az acr login --name "$ACR"
+          for name in frontend api worker; do
+            img="$ACR_LOGIN_SERVER/footballai-$name:$SHA"
+            plat=$(docker buildx imagetools inspect "$img" --format '{{.Image.OS}}/{{.Image.Architecture}}' 2>/dev/null) \
+              || { echo "::error::$img not found in ACR"; exit 1; }
+            [[ "$plat" == "linux/amd64" ]] || { echo "::error::$img is $plat, expected linux/amd64"; exit 1; }
+            echo "footballai-$name: exists, $plat"
+          done
+
+      - name: Ensure PostgreSQL is Ready (do not auto-start cost-bearing infra)
+        run: |
+          set -euo pipefail
+          PG_NAME=$(az postgres flexible-server list -g "$RG" --query '[0].name' -o tsv)
+          PG_STATE=$(az postgres flexible-server show -g "$RG" -n "$PG_NAME" --query 'state' -o tsv)
+          echo "PostgreSQL $PG_NAME state=$PG_STATE"
+          if [[ "$PG_STATE" != "Ready" ]]; then
+            echo "::error::PostgreSQL '$PG_NAME' is '$PG_STATE'. Start it deliberately before the P6 plan:"
+            echo "::error::  az postgres flexible-server start -g $RG -n $PG_NAME"
+            exit 1
+          fi
+
+      - name: Terraform init + full-refresh plan (no -refresh=false, no -target)
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_ROOT" init -input=false -no-color
+          terraform -chdir="$TF_ROOT" plan -input=false -no-color -lock-timeout=120s -out=tfplan \
+            -var "subscription_id=${{ vars.AZURE_SUBSCRIPTION_ID }}" \
+            -var "deploy_workloads=true" \
+            -var "image_tag=${{ inputs.release_sha }}"
+
+      - name: P6-specific plan policy (exact allowlist, 9/5/0/0, reviewed hash)
+        id: policy
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_ROOT" show -json tfplan > plan.json
+          python3 infra/terraform/scripts/p6_plan_policy.py \
+            --require-hash "$P6_REVIEWED_HASH" plan.json | tee policy.txt
+          hash=$(awk -F= '/^summary_sha256=/{print $2}' policy.txt)
+          echo "summary_hash=$hash" >> "$GITHUB_OUTPUT"
+          { echo "### P6 plan (sanitized) — image ${{ inputs.release_sha }}"; echo '```'; cat policy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: P6 apply (approval-gated)
+    needs: plan
+    # Runs ONLY when explicitly requested. A bare dispatch is plan-only, so no
+    # staging deployment is queued and no reviewer is asked to approve.
+    if: ${{ inputs.run_apply }}
+    runs-on: ubuntu-latest
+    environment: staging # OIDC deploy identity + REQUIRED REVIEWER approval (manual, UI)
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out EXACTLY the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_sha }}
+
+      - name: Prove the checkout is the requested release commit
+        run: |
+          set -euo pipefail
+          head=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
+          [[ "$head" == "${{ inputs.release_sha }}" ]] \
+            || { echo "::error::checked-out HEAD $head != release_sha ${{ inputs.release_sha }}"; exit 1; }
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Azure login via OIDC (deploy identity)
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Re-verify images still exist
+        run: |
+          set -euo pipefail
+          SHA="${{ inputs.release_sha }}"
+          az acr login --name "$ACR"
+          for name in frontend api worker; do
+            docker buildx imagetools inspect "$ACR_LOGIN_SERVER/footballai-$name:$SHA" >/dev/null \
+              || { echo "::error::footballai-$name:$SHA missing"; exit 1; }
+          done
+
+      - name: Terraform init + fresh full-refresh plan
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_ROOT" init -input=false -no-color
+          terraform -chdir="$TF_ROOT" plan -input=false -no-color -lock-timeout=120s -out=tfplan \
+            -var "subscription_id=${{ vars.AZURE_SUBSCRIPTION_ID }}" \
+            -var "deploy_workloads=true" \
+            -var "image_tag=${{ inputs.release_sha }}"
+
+      - name: Re-run P6 policy and prove equivalence to the approved plan
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_ROOT" show -json tfplan > plan.json
+          python3 infra/terraform/scripts/p6_plan_policy.py \
+            --require-hash "$P6_REVIEWED_HASH" plan.json | tee policy.txt
+          hash=$(awk -F= '/^summary_sha256=/{print $2}' policy.txt)
+          approved="${{ needs.plan.outputs.summary_hash }}"
+          echo "reviewed=$P6_REVIEWED_HASH approved=$approved current=$hash"
+          [[ "$hash" == "$P6_REVIEWED_HASH" ]] || { echo "::error::plan hash != reviewed hash; refusing to apply"; exit 1; }
+          [[ "$hash" == "$approved" ]] || { echo "::error::plan changed since approval ($approved -> $hash); refusing to apply"; exit 1; }
+
+      - name: Terraform apply (exact approved P6 plan)
+        run: terraform -chdir="$TF_ROOT" apply -input=false -no-color -lock-timeout=120s tfplan
+
+      - name: Run database migration job and wait
+        run: |
+          set -euo pipefail
+          echo "Starting $MIGRATION_JOB..."
+          az containerapp job start -n "$MIGRATION_JOB" -g "$RG" -o none
+          exec_name=$(az containerapp job execution list -n "$MIGRATION_JOB" -g "$RG" --query "[0].name" -o tsv)
+          echo "Execution: $exec_name"
+          for i in $(seq 1 60); do
+            status=$(az containerapp job execution show -n "$MIGRATION_JOB" -g "$RG" --job-execution-name "$exec_name" --query "properties.status" -o tsv)
+            echo "  [$i] status=$status"
+            case "$status" in
+              Succeeded) echo "migration succeeded"; exit 0 ;;
+              Failed|Degraded) echo "::error::migration $status"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::migration did not complete in time"; exit 1
+
+      - name: Post-deploy smoke (frontend health + API readiness via proxy)
+        run: bash scripts/ci/smoke-staging.sh
