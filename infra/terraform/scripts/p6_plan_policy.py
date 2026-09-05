@@ -1,26 +1,37 @@
 #!/usr/bin/env python3
-"""TEMPORARY, P6-SPECIFIC Terraform plan safety policy.
+"""TEMPORARY, P6-SPECIFIC Terraform plan safety policy (POST-PARTIAL-APPLY RECOVERY).
 
 REMOVE AFTER P6 STAGING VALIDATION.
 
 The steady-state deploy uses `plan_policy.py`, which deliberately rejects any
 foundation change and so (correctly) refuses the P6 observability rollout. P6
 intentionally adds Application Insights, a diagnostic setting, five metric
-alerts, two narrow role assignments, and reconfigures the four workloads and the
-Container Apps environment. This one-time policy authorizes EXACTLY that plan and
-nothing else, so a tightly-reviewed infrastructure apply can proceed once without
-weakening the generic policy.
+alerts, two narrow role assignments, and reconfigures the four workloads. This
+one-time policy authorizes EXACTLY that plan and nothing else, so a
+tightly-reviewed infrastructure apply can proceed once without weakening the
+generic policy.
+
+RECOVERY CONTRACT
+-----------------
+The ORIGINAL reviewed pre-apply plan was Add=9, Change=5 (hash 3f3de0cf...): it
+also reconfigured the Container Apps Environment. That apply partially succeeded
+— it converged the environment's logging destination (azure-monitor) before the
+Application-Insights-backed resources failed. The environment is therefore
+already converged, so its in-place update is intentionally REMOVED from this
+policy. The authoritative remaining plan is Add=9, Change=4 (hash 788aaab8...):
+the original plan minus exactly the `azurerm_container_app_environment.staging`
+update. If that update reappears, this policy MUST refuse it.
 
 Reads `terraform show -json <plan>` (file arg or stdin) and enforces:
 
   1. NO destroy and NO replace anywhere (any change whose actions contain
      "delete" is rejected).
-  2. Every changed resource must be in the exact P6 allowlist below, and its
-     action must match the reviewed action (create vs update) exactly.
+  2. Every changed resource must be in the exact P6 recovery allowlist below,
+     and its action must match the reviewed action (create vs update) exactly.
   3. Every allowlisted resource must appear exactly once (no missing, no
      duplicate index).
-  4. The totals must be exactly Add=9, Change=5, Destroy=0, Replace=0.
-  5. The deterministic sanitized-plan hash must equal the reviewed hash
+  4. The totals must be exactly Add=9, Change=4, Destroy=0, Replace=0.
+  5. The deterministic sanitized-plan hash must equal the reviewed recovery hash
      (unless the gate is explicitly relaxed for testing).
 
 Output is SANITIZED: resource address + actions only, never any attribute value,
@@ -35,9 +46,11 @@ import hashlib
 import json
 import sys
 
-# Exact P6 allowlist: bare `type.name` (module prefix and count/for_each index
-# stripped) -> the single reviewed action for that resource. Nothing outside
-# this set may change, and no resource here may take a different action.
+# Exact P6 recovery allowlist: bare `type.name` (module prefix and
+# count/for_each index stripped) -> the single reviewed action for that
+# resource. Nothing outside this set may change, and no resource here may take a
+# different action. The Container Apps Environment update is intentionally ABSENT
+# (already converged by the partial apply) and must not reappear.
 P6_ALLOWLIST: dict[str, str] = {
     # 9 creates
     "azurerm_application_insights.staging": "create",
@@ -49,8 +62,7 @@ P6_ALLOWLIST: dict[str, str] = {
     "azurerm_monitor_metric_alert.worker_job_failure": "create",
     "azurerm_role_assignment.application_insights_api": "create",
     "azurerm_role_assignment.application_insights_worker": "create",
-    # 5 updates
-    "azurerm_container_app_environment.staging": "update",
+    # 4 updates (the Container Apps Environment update has already converged)
     "azurerm_container_app.api": "update",
     "azurerm_container_app.frontend": "update",
     "azurerm_container_app_job.migration": "update",
@@ -58,13 +70,15 @@ P6_ALLOWLIST: dict[str, str] = {
 }
 
 EXPECTED_ADD = 9
-EXPECTED_CHANGE = 5
+EXPECTED_CHANGE = 4
 EXPECTED_DESTROY = 0
 EXPECTED_REPLACE = 0
 
 # SHA-256 over the canonical sanitized (address+actions) representation of the
-# reviewed P6 plan built from source SHA 43973346a1aa45f6a1e6c43ea1a3e87ed5bfd272.
-REVIEWED_SHA256 = "3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d"
+# POST-PARTIAL-APPLY RECOVERY plan (the original reviewed plan minus the
+# already-converged azurerm_container_app_environment.staging update). The
+# superseded pre-apply hash was 3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d.
+REVIEWED_SHA256 = "788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee"
 
 # Actions Terraform may report; "no-op"/"read" never count as changes.
 NOOP_ACTIONS = ({"no-op"}, {"read"})
@@ -230,7 +244,7 @@ def main(argv: list[str]) -> int:
             print(f"  - {v}", file=sys.stderr)
         return 2
 
-    print("p6-plan-policy: PASS (exact P6 allowlist, 9/5/0/0, reviewed hash matched)")
+    print("p6-plan-policy: PASS (exact P6 recovery allowlist, 9/4/0/0, recovery hash matched)")
     return 0
 
 

@@ -6,16 +6,23 @@
 # The steady-state `deploy-staging.yml` + `plan_policy.py` correctly REFUSE the
 # P6 observability rollout, because P6 deliberately changes foundation
 # resources (Application Insights, a diagnostic setting, five metric alerts, two
-# narrow role assignments, and the Container Apps environment) alongside the
-# four workloads. This ONE-TIME workflow authorizes EXACTLY that reviewed plan —
-# and nothing else — so the P6 infrastructure can be applied once, under a real
-# human approval boundary, without weakening the generic deploy policy.
+# narrow role assignments) alongside the four workloads. This ONE-TIME workflow
+# authorizes EXACTLY that reviewed plan — and nothing else — so the P6
+# infrastructure can be applied once, under a real human approval boundary,
+# without weakening the generic deploy policy.
+#
+# POST-PARTIAL-APPLY RECOVERY: the original reviewed plan (9/5/0/0, hash
+# 3f3de0cf...) also reconfigured the Container Apps Environment. That apply
+# partially succeeded — the environment's logging destination converged to
+# azure-monitor before the Application-Insights-backed resources failed — so the
+# environment update is already applied and is intentionally REMOVED here. The
+# authoritative remaining contract is 9/4/0/0, hash 788aaab8...
 #
 #   plan  (staging-plan env, Reader plan identity)  -> sanitized safety-checked
-#         plan, exact P6 allowlist, 9/5/0/0, reviewed-hash match
+#         plan, exact P6 recovery allowlist, 9/4/0/0, recovery-hash match
 #     |   REQUIRED reviewer approval on the `staging` environment (manual, UI)
 #   apply (staging env, deploy identity) -> fresh re-plan, same policy, same
-#         reviewed hash + equal to the approved plan, apply, migrate, smoke
+#         recovery hash + equal to the approved plan, apply, migrate, smoke
 #
 # Dispatch only. No push, no PR, no schedule, no workflow_run. Delete this file
 # once P6 staging is validated.
@@ -74,8 +81,10 @@ env:
   ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
   MIGRATION_JOB: caj-footballai-stg-db-migrate
   # Reviewed Terraform resource/action contract (SHA-256 over the canonical
-  # sanitized plan). NOT a Git SHA — see the header note.
-  P6_REVIEWED_HASH: 3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d
+  # sanitized plan). NOT a Git SHA — see the header note. This is the
+  # POST-PARTIAL-APPLY RECOVERY contract (9/4/0/0); the superseded pre-apply
+  # contract was 3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d.
+  P6_REVIEWED_HASH: 788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee
 
 jobs:
   plan:
@@ -156,7 +165,7 @@ jobs:
             -var "deploy_workloads=true" \
             -var "image_tag=${{ inputs.release_sha }}"
 
-      - name: P6-specific plan policy (exact allowlist, 9/5/0/0, reviewed hash)
+      - name: P6-specific plan policy (exact recovery allowlist, 9/4/0/0, recovery hash)
         id: policy
         run: |
           set -euo pipefail
