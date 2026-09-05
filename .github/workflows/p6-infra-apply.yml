@@ -28,6 +28,27 @@
 # once P6 staging is validated.
 #
 # -----------------------------------------------------------------------------
+# CONTROL PLANE vs RELEASE PAYLOAD — TWO SEPARATE CHECKOUTS
+# -----------------------------------------------------------------------------
+# The recovery POLICY (the reviewed governance contract) and the RELEASE PAYLOAD
+# (the Terraform config + application/deploy scripts) live at DIFFERENT commits
+# and must be checked out into DIFFERENT directories:
+#
+#   * control-plane/  <- this workflow's own host commit (github.sha, on main).
+#                        Source of `p6_plan_policy.py` — the 9/4/0/0 recovery
+#                        contract. Governance evolves on main independently of
+#                        the frozen release.
+#   * release/        <- exactly release_sha. Source of the Terraform root, the
+#                        application, and smoke/deploy scripts. Frozen payload.
+#
+# Terraform ALWAYS runs from release/; the policy ALWAYS runs from
+# control-plane/. Run 33959502997 failed precisely because a single checkout at
+# release_sha let the frozen release payload SHADOW the control-plane policy:
+# the release commit (dd5151b) still carried the superseded pre-apply policy
+# (9/5, hash 3f3de0cf, with the CAE update), so it rejected the correct live
+# 9/4 recovery plan. Two pinned checkouts make that shadowing impossible.
+#
+# -----------------------------------------------------------------------------
 # WHY GIT PROVENANCE IS A DISPATCH INPUT, NOT A HARD-CODED SHA
 # -----------------------------------------------------------------------------
 # A tracked workflow cannot reliably hard-code the Git SHA of the commit that
@@ -74,7 +95,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TF_ROOT: infra/terraform/environments/staging
+  # RELEASE PAYLOAD (pinned to release_sha, checked out into release/): the
+  # Terraform root and the application/deploy scripts.
+  TF_ROOT: release/infra/terraform/environments/staging
+  SMOKE_SCRIPT: release/scripts/ci/smoke-staging.sh
+  # CONTROL PLANE (pinned to this workflow's host commit, checked out into
+  # control-plane/): the P6 recovery policy. NEVER resolved from the release
+  # checkout — that shadowing is the bug this layout removes.
+  P6_POLICY: control-plane/infra/terraform/scripts/p6_plan_policy.py
   RG: ${{ vars.AZURE_RESOURCE_GROUP }}
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
   ACR: ${{ vars.ACR_NAME }}
@@ -105,19 +133,46 @@ jobs:
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "::error::release_sha '$SHA' is not a 40-char lowercase Git SHA"; exit 1; }
           echo "Release provenance SHA: $SHA"
+          echo "Control-plane host: ${{ github.ref }} @ ${{ github.sha }}"
 
-      - name: Check out EXACTLY the release commit (never trust a branch name)
+      - name: Check out the CONTROL PLANE (recovery policy) at this workflow's host commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control-plane
+
+      - name: Check out the RELEASE PAYLOAD (Terraform + scripts) at EXACTLY release_sha
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.release_sha }}
+          path: release
 
-      - name: Prove the checkout is the requested release commit
+      - name: Prove both checkouts are separated and pinned to the right commits
         run: |
           set -euo pipefail
-          head=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
-          [[ "$head" == "${{ inputs.release_sha }}" ]] \
-            || { echo "::error::checked-out HEAD $head != release_sha ${{ inputs.release_sha }}"; exit 1; }
-          echo "HEAD confirmed at ${{ inputs.release_sha }}"
+          rel=$(git -C "$GITHUB_WORKSPACE/release" rev-parse HEAD)
+          ctl=$(git -C "$GITHUB_WORKSPACE/control-plane" rev-parse HEAD)
+          [[ "$rel" == "${{ inputs.release_sha }}" ]] \
+            || { echo "::error::release HEAD $rel != release_sha ${{ inputs.release_sha }}"; exit 1; }
+          [[ "$ctl" == "${{ github.sha }}" ]] \
+            || { echo "::error::control-plane HEAD $ctl != workflow-host ${{ github.sha }}"; exit 1; }
+          echo "Release payload HEAD: $rel (release_sha)"
+          echo "Control-plane   HEAD: $ctl (workflow host ${{ github.ref }})"
+
+      - name: Prove the CONTROL policy is the 9/4 recovery contract (not a stale release policy)
+        run: |
+          set -euo pipefail
+          test -f "$P6_POLICY" || { echo "::error::control policy $P6_POLICY not found"; exit 1; }
+          grep -q 'EXPECTED_ADD = 9' "$P6_POLICY" \
+            || { echo "::error::control policy EXPECTED_ADD != 9"; exit 1; }
+          grep -q 'EXPECTED_CHANGE = 4' "$P6_POLICY" \
+            || { echo "::error::control policy EXPECTED_CHANGE != 4 (stale 9/5 pre-apply policy?)"; exit 1; }
+          grep -q "$P6_REVIEWED_HASH" "$P6_POLICY" \
+            || { echo "::error::control policy missing recovery hash $P6_REVIEWED_HASH"; exit 1; }
+          if grep -qE '"azurerm_container_app_environment\.staging"[[:space:]]*:' "$P6_POLICY"; then
+            echo "::error::control policy still lists azurerm_container_app_environment.staging in the allowlist"; exit 1
+          fi
+          echo "Control policy OK: Add=9 Change=4, recovery hash present, CAE update absent from allowlist"
 
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
@@ -165,12 +220,13 @@ jobs:
             -var "deploy_workloads=true" \
             -var "image_tag=${{ inputs.release_sha }}"
 
-      - name: P6-specific plan policy (exact recovery allowlist, 9/4/0/0, recovery hash)
+      - name: P6-specific plan policy (from CONTROL PLANE — recovery allowlist, 9/4/0/0, recovery hash)
         id: policy
         run: |
           set -euo pipefail
           terraform -chdir="$TF_ROOT" show -json tfplan > plan.json
-          python3 infra/terraform/scripts/p6_plan_policy.py \
+          echo "Running recovery policy from control plane: $P6_POLICY"
+          python3 "$P6_POLICY" \
             --require-hash "$P6_REVIEWED_HASH" plan.json | tee policy.txt
           hash=$(awk -F= '/^summary_sha256=/{print $2}' policy.txt)
           echo "summary_hash=$hash" >> "$GITHUB_OUTPUT"
@@ -189,17 +245,44 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Check out EXACTLY the release commit
+      - name: Check out the CONTROL PLANE (recovery policy) at this workflow's host commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control-plane
+
+      - name: Check out the RELEASE PAYLOAD (Terraform + scripts) at EXACTLY release_sha
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.release_sha }}
+          path: release
 
-      - name: Prove the checkout is the requested release commit
+      - name: Prove both checkouts are separated and pinned to the right commits
         run: |
           set -euo pipefail
-          head=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
-          [[ "$head" == "${{ inputs.release_sha }}" ]] \
-            || { echo "::error::checked-out HEAD $head != release_sha ${{ inputs.release_sha }}"; exit 1; }
+          rel=$(git -C "$GITHUB_WORKSPACE/release" rev-parse HEAD)
+          ctl=$(git -C "$GITHUB_WORKSPACE/control-plane" rev-parse HEAD)
+          [[ "$rel" == "${{ inputs.release_sha }}" ]] \
+            || { echo "::error::release HEAD $rel != release_sha ${{ inputs.release_sha }}"; exit 1; }
+          [[ "$ctl" == "${{ github.sha }}" ]] \
+            || { echo "::error::control-plane HEAD $ctl != workflow-host ${{ github.sha }}"; exit 1; }
+          echo "Release payload HEAD: $rel (release_sha)"
+          echo "Control-plane   HEAD: $ctl (workflow host ${{ github.ref }})"
+
+      - name: Prove the CONTROL policy is the 9/4 recovery contract (not a stale release policy)
+        run: |
+          set -euo pipefail
+          test -f "$P6_POLICY" || { echo "::error::control policy $P6_POLICY not found"; exit 1; }
+          grep -q 'EXPECTED_ADD = 9' "$P6_POLICY" \
+            || { echo "::error::control policy EXPECTED_ADD != 9"; exit 1; }
+          grep -q 'EXPECTED_CHANGE = 4' "$P6_POLICY" \
+            || { echo "::error::control policy EXPECTED_CHANGE != 4 (stale 9/5 pre-apply policy?)"; exit 1; }
+          grep -q "$P6_REVIEWED_HASH" "$P6_POLICY" \
+            || { echo "::error::control policy missing recovery hash $P6_REVIEWED_HASH"; exit 1; }
+          if grep -qE '"azurerm_container_app_environment\.staging"[[:space:]]*:' "$P6_POLICY"; then
+            echo "::error::control policy still lists azurerm_container_app_environment.staging in the allowlist"; exit 1
+          fi
+          echo "Control policy OK: Add=9 Change=4, recovery hash present, CAE update absent from allowlist"
 
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
@@ -232,11 +315,12 @@ jobs:
             -var "deploy_workloads=true" \
             -var "image_tag=${{ inputs.release_sha }}"
 
-      - name: Re-run P6 policy and prove equivalence to the approved plan
+      - name: Re-run P6 policy (from CONTROL PLANE) and prove equivalence to the approved plan
         run: |
           set -euo pipefail
           terraform -chdir="$TF_ROOT" show -json tfplan > plan.json
-          python3 infra/terraform/scripts/p6_plan_policy.py \
+          echo "Running recovery policy from control plane: $P6_POLICY"
+          python3 "$P6_POLICY" \
             --require-hash "$P6_REVIEWED_HASH" plan.json | tee policy.txt
           hash=$(awk -F= '/^summary_sha256=/{print $2}' policy.txt)
           approved="${{ needs.plan.outputs.summary_hash }}"
@@ -266,4 +350,4 @@ jobs:
           echo "::error::migration did not complete in time"; exit 1
 
       - name: Post-deploy smoke (frontend health + API readiness via proxy)
-        run: bash scripts/ci/smoke-staging.sh
+        run: bash "$SMOKE_SCRIPT"
