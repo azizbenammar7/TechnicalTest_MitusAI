@@ -7,17 +7,30 @@ validation.
 
 Contract history
 ----------------
-The ORIGINAL reviewed pre-apply plan was 9 add / 5 change / 0 destroy /
-0 replace, hash 3f3de0cf...  That apply partially succeeded: it converged the
-Container Apps Environment logging destination (azure-monitor) before the
-Application-Insights-backed resources failed. The environment is therefore
-already converged and its in-place update must NOT reappear.
+Each contract below was CORRECT for the live Azure state at the time it was
+reviewed; later partial applies converged more resources, shrinking the
+remaining plan. All three are pinned here so a regression to an earlier
+contract is caught rather than silently passing.
 
-The authoritative POST-PARTIAL-APPLY RECOVERY plan is the original plan minus
-exactly that one `azurerm_container_app_environment.staging` update: 9 add /
-4 change / 0 destroy / 0 replace, hash 788aaab8...  Both hashes are pinned
-below so a change to either the policy or the plan is caught here rather than
-silently passing.
+1. ORIGINAL pre-apply plan — 9 add / 5 change / 0 destroy / 0 replace,
+   hash 3f3de0cf...  Included an in-place update of the Container Apps
+   Environment (logging destination -> azure-monitor).
+
+2. FIRST partial-apply recovery — 9 add / 4 change / 0 destroy / 0 replace,
+   hash 788aaab8...  The first apply converged the Container Apps Environment
+   logging destination before the Application-Insights-backed resources failed,
+   so the environment update dropped out (original minus exactly the
+   `azurerm_container_app_environment.staging` update).
+
+3. FINAL second partial-apply recovery (CURRENT / AUTHORITATIVE) —
+   5 add / 5 change / 0 destroy / 0 replace, hash 8e0e9424...  The second apply
+   created Application Insights, the diagnostic setting, and the two Service Bus
+   alerts before failing on the Application-Insights role assignments (RBAC).
+   Those four creates have therefore converged and drop out; the diagnostic
+   setting now shows as an in-place UPDATE (Terraform normalizes
+   `log_analytics_destination_type = "Dedicated"`). What remains is exactly the
+   three job/server-error metric alerts + two role assignments to create, and
+   the four workloads + diagnostic setting to update.
 """
 
 from __future__ import annotations
@@ -36,11 +49,33 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 POLICY_PATH = ROOT / "infra" / "terraform" / "scripts" / "p6_plan_policy.py"
 
-# The exact RECOVERY plan, as `terraform show -json` reports resource_changes
-# (only the fields the policy reads: address + change.actions). Nine creates,
-# four updates: the reviewed 9/4/0/0 recovery plan on the P6 release. The
-# Container Apps Environment update is intentionally ABSENT (already converged).
+# --- CURRENT authoritative contract: the FINAL second-partial recovery plan ----
+# The exact live plan, as `terraform show -json` reports resource_changes (only
+# the fields the policy reads: address + change.actions). Five creates, five
+# updates. Application Insights, the diagnostic setting create, and the two
+# Service Bus alerts have already converged and are intentionally ABSENT; the
+# diagnostic setting now appears as an in-place UPDATE.
 RECOVERY_CHANGES = [
+    # 5 creates
+    ("azurerm_monitor_metric_alert.api_server_errors[0]", ["create"]),
+    ("azurerm_monitor_metric_alert.migration_job_failure[0]", ["create"]),
+    ("azurerm_monitor_metric_alert.worker_job_failure[0]", ["create"]),
+    ("azurerm_role_assignment.application_insights_api", ["create"]),
+    ("azurerm_role_assignment.application_insights_worker", ["create"]),
+    # 5 updates
+    ("azurerm_container_app.api[0]", ["update"]),
+    ("azurerm_container_app.frontend[0]", ["update"]),
+    ("azurerm_container_app_job.migration[0]", ["update"]),
+    ("azurerm_container_app_job.worker[0]", ["update"]),
+    ("azurerm_monitor_diagnostic_setting.container_app_environment", ["update"]),
+]
+
+# --- HISTORICAL: the FIRST partial-apply recovery plan (9/4) -------------------
+# The superseded contract. Kept so the current policy proves it now REJECTS the
+# 13-action first-recovery plan (Application Insights + two Service Bus alerts
+# creates, plus the diagnostic setting as a CREATE rather than an UPDATE).
+FIRST_RECOVERY_CHANGES = [
+    # 9 creates
     ("azurerm_application_insights.staging", ["create"]),
     ("azurerm_monitor_diagnostic_setting.container_app_environment", ["create"]),
     ("azurerm_monitor_metric_alert.api_server_errors[0]", ["create"]),
@@ -50,24 +85,37 @@ RECOVERY_CHANGES = [
     ("azurerm_monitor_metric_alert.worker_job_failure[0]", ["create"]),
     ("azurerm_role_assignment.application_insights_api", ["create"]),
     ("azurerm_role_assignment.application_insights_worker", ["create"]),
+    # 4 updates
     ("azurerm_container_app.api[0]", ["update"]),
     ("azurerm_container_app.frontend[0]", ["update"]),
     ("azurerm_container_app_job.migration[0]", ["update"]),
     ("azurerm_container_app_job.worker[0]", ["update"]),
 ]
 
-# The ORIGINAL pre-apply plan (historical): the recovery plan PLUS the one
-# Container Apps Environment update that has since converged. Kept so the test
-# suite proves the recovery policy now REJECTS the superseded 14-action plan.
-ORIGINAL_PRE_APPLY_CHANGES = RECOVERY_CHANGES + [
+# --- HISTORICAL: the ORIGINAL pre-apply plan (9/5) ----------------------------
+# The first-recovery plan PLUS the one Container Apps Environment update that has
+# since converged. Kept so the current policy proves it rejects the superseded
+# 14-action plan.
+ORIGINAL_PRE_APPLY_CHANGES = FIRST_RECOVERY_CHANGES + [
     ("azurerm_container_app_environment.staging", ["update"]),
 ]
 
 # Independently pinned expectations (must equal the constants baked into the
 # policy) so a change to either side is caught here rather than silently passing.
-RECOVERY_HASH = "788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee"
-# Historical only — the recovery policy must reject this.
+RECOVERY_HASH = "8e0e942484af7a868fd09703cebf7aef941d797c7a177e4d01e6620b3b94cd9d"
+# Historical only — the current policy must reject both of these.
+FIRST_RECOVERY_HASH = "788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee"
 ORIGINAL_PRE_APPLY_HASH = "3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d"
+
+# Resources that converged during the second partial apply. A create for any of
+# these reappearing in the plan is a policy violation.
+CONVERGED_CREATES = [
+    "azurerm_application_insights.staging",
+    "azurerm_monitor_metric_alert.servicebus_dead_letter",
+    "azurerm_monitor_metric_alert.servicebus_queue_backlog",
+    # the Container Apps Environment converged during the FIRST partial apply
+    "azurerm_container_app_environment.staging",
+]
 
 
 def _load_policy() -> ModuleType:
@@ -95,6 +143,10 @@ def _recovery_plan() -> dict:
     return _plan(RECOVERY_CHANGES)
 
 
+def _first_recovery_plan() -> dict:
+    return _plan(FIRST_RECOVERY_CHANGES)
+
+
 def _original_pre_apply_plan() -> dict:
     return _plan(ORIGINAL_PRE_APPLY_CHANGES)
 
@@ -111,40 +163,65 @@ def test_recovery_plan_hashes_to_recovery_hash():
     assert result["summary_hash"] == RECOVERY_HASH
 
 
-def test_policy_no_longer_pins_the_original_pre_apply_hash():
-    # Guards against a copy-paste regression that reintroduces the old contract.
+def test_policy_no_longer_pins_superseded_hashes():
+    # Guards against a copy-paste regression that reintroduces an old contract.
+    assert policy.REVIEWED_SHA256 != FIRST_RECOVERY_HASH
     assert policy.REVIEWED_SHA256 != ORIGINAL_PRE_APPLY_HASH
 
 
-# --- 1. exact recovery plan -> PASS -------------------------------------------
+def test_policy_counts_are_five_five():
+    assert policy.EXPECTED_ADD == 5
+    assert policy.EXPECTED_CHANGE == 5
+    assert policy.EXPECTED_DESTROY == 0
+    assert policy.EXPECTED_REPLACE == 0
+
+
+# --- 1. exact 5/5 recovery plan -> PASS ---------------------------------------
 
 
 def test_exact_recovery_plan_passes():
     result = policy.evaluate(_recovery_plan())
     assert result["ok"], result["violations"]
     assert result["violations"] == []
-    assert result["counts"] == {"add": 9, "change": 4, "destroy": 0, "replace": 0}
+    assert result["counts"] == {"add": 5, "change": 5, "destroy": 0, "replace": 0}
 
 
 def test_no_op_and_read_changes_are_ignored():
     changes = RECOVERY_CHANGES + [
         ("azurerm_resource_group.staging", ["no-op"]),
         ("data.azurerm_client_config.current", ["read"]),
-        # The already-converged environment now shows as a no-op, not an update.
+        # The already-converged resources now show as no-ops, not changes.
+        ("azurerm_application_insights.staging", ["no-op"]),
         ("azurerm_container_app_environment.staging", ["no-op"]),
+        ("azurerm_monitor_metric_alert.servicebus_dead_letter", ["no-op"]),
+        ("azurerm_monitor_metric_alert.servicebus_queue_backlog", ["no-op"]),
     ]
     result = policy.evaluate(_plan(changes))
     assert result["ok"], result["violations"]
     assert result["summary_hash"] == RECOVERY_HASH
 
 
-# --- 2. original 14-action pre-apply plan -> FAIL -----------------------------
+# --- 2. the 9/4 first-recovery plan -> FAIL -----------------------------------
+
+
+def test_first_recovery_plan_is_rejected():
+    # App Insights + the two Service Bus alerts have converged; if their creates
+    # reappear the current policy must refuse. The diagnostic setting is now an
+    # UPDATE, so its historical CREATE is also a wrong-action violation.
+    result = policy.evaluate(_first_recovery_plan())
+    assert not result["ok"]
+    assert any(
+        "not in P6 allowlist" in v and "azurerm_application_insights.staging" in v
+        for v in result["violations"]
+    )
+    assert any("totals mismatch" in v for v in result["violations"])
+    assert any("hash mismatch" in v for v in result["violations"])
+
+
+# --- 3. original 14-action pre-apply plan -> FAIL -----------------------------
 
 
 def test_original_pre_apply_plan_is_rejected():
-    # The environment update has converged; if it reappears the recovery policy
-    # must refuse: it is no longer allowlisted, the totals are 9/5 not 9/4, and
-    # the sanitized set no longer matches the recovery hash.
     result = policy.evaluate(_original_pre_apply_plan())
     assert not result["ok"]
     assert any(
@@ -156,7 +233,39 @@ def test_original_pre_apply_plan_is_rejected():
     assert any("hash mismatch" in v for v in result["violations"])
 
 
-# --- 3. unexpected create -> FAIL ---------------------------------------------
+# --- 4/5/6. an already-converged create reappearing -> FAIL -------------------
+
+
+@pytest.mark.parametrize("converged", CONVERGED_CREATES)
+def test_converged_create_reappearing_fails(converged):
+    changes = RECOVERY_CHANGES + [(converged, ["create"])]
+    result = policy.evaluate(_plan(changes))
+    assert not result["ok"]
+    assert any(
+        "not in P6 allowlist" in v and converged in v for v in result["violations"]
+    ), result["violations"]
+    # And the totals/hash gates also trip because the sanitized set differs.
+    assert any("totals mismatch" in v for v in result["violations"])
+    assert any("hash mismatch" in v for v in result["violations"])
+
+
+# --- 7. missing expected action / count mismatch -> FAIL ----------------------
+
+
+def test_missing_resource_count_mismatch_fails():
+    changes = [
+        c
+        for c in RECOVERY_CHANGES
+        if c[0] != "azurerm_role_assignment.application_insights_worker"
+    ]
+    result = policy.evaluate(_plan(changes))
+    assert not result["ok"]
+    assert any("missing from plan" in v for v in result["violations"])
+    assert any("totals mismatch" in v for v in result["violations"])
+    assert any("hash mismatch" in v for v in result["violations"])
+
+
+# --- 8. unexpected resource -> FAIL -------------------------------------------
 
 
 def test_unexpected_create_fails():
@@ -166,9 +275,6 @@ def test_unexpected_create_fails():
     assert any("not in P6 allowlist" in v for v in result["violations"])
 
 
-# --- 4. unexpected update -> FAIL ---------------------------------------------
-
-
 def test_unexpected_update_fails():
     changes = RECOVERY_CHANGES + [("azurerm_key_vault.rogue", ["update"])]
     result = policy.evaluate(_plan(changes))
@@ -176,7 +282,37 @@ def test_unexpected_update_fails():
     assert any("not in P6 allowlist" in v for v in result["violations"])
 
 
-# --- 5. delete -> FAIL --------------------------------------------------------
+# --- 9. wrong action type -> FAIL ---------------------------------------------
+
+
+def test_correct_resource_wrong_action_fails():
+    # The diagnostic setting is reviewed as an UPDATE; a plan that CREATES it
+    # (as the first-recovery contract did) must fail on the action match.
+    changes = [
+        (addr, ["create"])
+        if addr == "azurerm_monitor_diagnostic_setting.container_app_environment"
+        else (addr, acts)
+        for addr, acts in RECOVERY_CHANGES
+    ]
+    result = policy.evaluate(_plan(changes))
+    assert not result["ok"]
+    assert any("unexpected action" in v for v in result["violations"])
+
+
+def test_role_assignment_wrong_action_fails():
+    # A role assignment reviewed as create; updating it must fail.
+    changes = [
+        (addr, ["update"])
+        if addr == "azurerm_role_assignment.application_insights_api"
+        else (addr, acts)
+        for addr, acts in RECOVERY_CHANGES
+    ]
+    result = policy.evaluate(_plan(changes))
+    assert not result["ok"]
+    assert any("totals mismatch" in v for v in result["violations"])
+
+
+# --- 10. delete -> FAIL -------------------------------------------------------
 
 
 def test_delete_fails():
@@ -187,13 +323,15 @@ def test_delete_fails():
     assert any(v.startswith("DESTROY not allowed") for v in result["violations"])
 
 
-# --- 6. replacement -> FAIL ---------------------------------------------------
+# --- 11. replace -> FAIL ------------------------------------------------------
 
 
 def test_replacement_fails():
     # An allowlisted address, but replaced (delete+create) rather than updated.
     changes = [
-        (addr, ["delete", "create"]) if addr == "azurerm_container_app.api[0]" else (addr, acts)
+        (addr, ["delete", "create"])
+        if addr == "azurerm_container_app.api[0]"
+        else (addr, acts)
         for addr, acts in RECOVERY_CHANGES
     ]
     result = policy.evaluate(_plan(changes))
@@ -201,20 +339,7 @@ def test_replacement_fails():
     assert any(v.startswith("REPLACE not allowed") for v in result["violations"])
 
 
-# --- 7. missing action / count mismatch -> FAIL -------------------------------
-
-
-def test_missing_resource_count_mismatch_fails():
-    changes = [c for c in RECOVERY_CHANGES if c[0] != "azurerm_role_assignment.application_insights_worker"]
-    result = policy.evaluate(_plan(changes))
-    assert not result["ok"]
-    assert any("missing from plan" in v for v in result["violations"])
-    assert any("totals mismatch" in v for v in result["violations"])
-    # Hash gate also trips because the sanitized set differs.
-    assert any("hash mismatch" in v for v in result["violations"])
-
-
-# --- 8. duplicate action -> FAIL ----------------------------------------------
+# --- 12. count mismatch (duplicate) -> FAIL -----------------------------------
 
 
 def test_duplicate_allowlisted_resource_fails():
@@ -224,55 +349,29 @@ def test_duplicate_allowlisted_resource_fails():
     assert any("duplicate change" in v for v in result["violations"])
 
 
-# --- 9. correct resources but wrong action -> FAIL ----------------------------
+# --- 13/14. old hashes -> FAIL ------------------------------------------------
 
 
-def test_correct_resource_wrong_action_fails():
-    # Application Insights reviewed as create; a plan that updates it must fail.
-    changes = [
-        (addr, ["update"]) if addr == "azurerm_application_insights.staging" else (addr, acts)
-        for addr, acts in RECOVERY_CHANGES
-    ]
-    result = policy.evaluate(_plan(changes))
+def test_first_recovery_hash_is_rejected():
+    # Even the exact 5/5 plan must be refused if the required hash is the
+    # superseded first-recovery hash.
+    result = policy.evaluate(_recovery_plan(), require_hash=FIRST_RECOVERY_HASH)
     assert not result["ok"]
-    assert any("unexpected action" in v for v in result["violations"])
+    assert any("hash mismatch" in v for v in result["violations"])
 
 
-# --- 10. Add/Change count mismatch -> FAIL ------------------------------------
-
-
-def test_add_change_count_mismatch_fails():
-    # Turn one reviewed create into an update: still 13 addresses, but 8/5 not
-    # 9/4. The action-match rule and the totals rule both trip.
-    changes = [
-        (addr, ["update"]) if addr == "azurerm_role_assignment.application_insights_api" else (addr, acts)
-        for addr, acts in RECOVERY_CHANGES
-    ]
-    result = policy.evaluate(_plan(changes))
-    assert not result["ok"]
-    assert any("totals mismatch" in v for v in result["violations"])
-
-
-# --- 11. old pre-apply hash -> FAIL -------------------------------------------
-
-
-def test_old_pre_apply_hash_is_rejected():
-    # Even the exact recovery plan must be refused if the required hash is the
-    # superseded pre-apply hash.
+def test_original_pre_apply_hash_is_rejected():
     result = policy.evaluate(_recovery_plan(), require_hash=ORIGINAL_PRE_APPLY_HASH)
     assert not result["ok"]
     assert any("hash mismatch" in v for v in result["violations"])
 
 
-# --- 12. new recovery hash -> PASS (covered by constant + plan hash above) -----
+# --- 15. new recovery hash -> PASS --------------------------------------------
 
 
 def test_recovery_hash_gate_passes_when_required_explicitly():
     result = policy.evaluate(_recovery_plan(), require_hash=RECOVERY_HASH)
     assert result["ok"], result["violations"]
-
-
-# --- canonical hash mismatch (arbitrary) -> FAIL ------------------------------
 
 
 def test_hash_gate_mismatch_fails():
@@ -300,6 +399,9 @@ def _run_cli(plan: dict, *extra: str):
     )
 
 
+# --- 17. deterministic CLI exit behavior --------------------------------------
+
+
 def test_cli_exit_zero_on_recovery_plan():
     proc = _run_cli(_recovery_plan())
     assert proc.returncode == 0, proc.stderr
@@ -314,22 +416,6 @@ def test_cli_exit_two_on_violation():
     assert "P6 POLICY VIOLATIONS" in proc.stderr
 
 
-# --- 13. secret values from plan JSON are never emitted -----------------------
-
-
-def test_cli_output_is_sanitized_addresses_and_actions_only():
-    # Feed a plan whose before/after carry a secret; it must never be emitted.
-    plan = _recovery_plan()
-    plan["resource_changes"][0]["change"]["after"] = {"connection_string": "SUPER_SECRET_VALUE"}
-    proc = _run_cli(plan)
-    assert proc.returncode == 0, proc.stderr
-    assert "SUPER_SECRET_VALUE" not in proc.stdout
-    assert "SUPER_SECRET_VALUE" not in proc.stderr
-
-
-# --- 14. CLI exit behavior remains deterministic ------------------------------
-
-
 def test_cli_bad_json_is_usage_error():
     proc = subprocess.run(
         [sys.executable, str(POLICY_PATH)],
@@ -340,8 +426,30 @@ def test_cli_bad_json_is_usage_error():
     assert proc.returncode == 1
 
 
+def test_cli_first_recovery_plan_exits_two():
+    # The superseded 13-action first-recovery plan must be a hard violation.
+    proc = _run_cli(_first_recovery_plan())
+    assert proc.returncode == 2
+    assert "P6 POLICY VIOLATIONS" in proc.stderr
+
+
 def test_cli_original_pre_apply_plan_exits_two():
-    # The superseded 14-action plan must be a hard policy violation at the CLI.
+    # The superseded 14-action pre-apply plan must be a hard violation.
     proc = _run_cli(_original_pre_apply_plan())
     assert proc.returncode == 2
     assert "P6 POLICY VIOLATIONS" in proc.stderr
+
+
+# --- 16. secret values from plan JSON are never emitted -----------------------
+
+
+def test_cli_output_is_sanitized_addresses_and_actions_only():
+    # Feed a plan whose before/after carry a secret; it must never be emitted.
+    plan = _recovery_plan()
+    plan["resource_changes"][0]["change"]["after"] = {
+        "connection_string": "SUPER_SECRET_VALUE"
+    }
+    proc = _run_cli(plan)
+    assert proc.returncode == 0, proc.stderr
+    assert "SUPER_SECRET_VALUE" not in proc.stdout
+    assert "SUPER_SECRET_VALUE" not in proc.stderr

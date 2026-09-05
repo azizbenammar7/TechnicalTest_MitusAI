@@ -11,15 +11,21 @@
 # infrastructure can be applied once, under a real human approval boundary,
 # without weakening the generic deploy policy.
 #
-# POST-PARTIAL-APPLY RECOVERY: the original reviewed plan (9/5/0/0, hash
-# 3f3de0cf...) also reconfigured the Container Apps Environment. That apply
-# partially succeeded — the environment's logging destination converged to
-# azure-monitor before the Application-Insights-backed resources failed — so the
-# environment update is already applied and is intentionally REMOVED here. The
-# authoritative remaining contract is 9/4/0/0, hash 788aaab8...
+# SECOND-PARTIAL-APPLY RECOVERY. Contract history (each was correct for the live
+# state when reviewed; successive partial applies converged more resources):
+#   * ORIGINAL pre-apply:        9/5/0/0, hash 3f3de0cf...  (also updated the CAE)
+#   * FIRST partial recovery:    9/4/0/0, hash 788aaab8...  (CAE update converged)
+#   * SECOND partial recovery:   5/5/0/0, hash 8e0e9424...  (THIS contract)
+# The second apply created Application Insights, the diagnostic setting, and the
+# two Service Bus alerts before failing on the Application-Insights role
+# assignments (an RBAC write). Those four creates have converged and are
+# intentionally REMOVED here; the diagnostic setting now shows as an in-place
+# UPDATE (log_analytics_destination_type normalized to "Dedicated"). What remains
+# is 5 creates (three metric alerts + two role assignments) and 5 updates (the
+# four workloads + the diagnostic setting).
 #
 #   plan  (staging-plan env, Reader plan identity)  -> sanitized safety-checked
-#         plan, exact P6 recovery allowlist, 9/4/0/0, recovery-hash match
+#         plan, exact P6 recovery allowlist, 5/5/0/0, recovery-hash match
 #     |   REQUIRED reviewer approval on the `staging` environment (manual, UI)
 #   apply (staging env, deploy identity) -> fresh re-plan, same policy, same
 #         recovery hash + equal to the approved plan, apply, migrate, smoke
@@ -35,7 +41,7 @@
 # and must be checked out into DIFFERENT directories:
 #
 #   * control-plane/  <- this workflow's own host commit (github.sha, on main).
-#                        Source of `p6_plan_policy.py` — the 9/4/0/0 recovery
+#                        Source of `p6_plan_policy.py` — the 5/5/0/0 recovery
 #                        contract. Governance evolves on main independently of
 #                        the frozen release.
 #   * release/        <- exactly release_sha. Source of the Terraform root, the
@@ -110,9 +116,12 @@ env:
   MIGRATION_JOB: caj-footballai-stg-db-migrate
   # Reviewed Terraform resource/action contract (SHA-256 over the canonical
   # sanitized plan). NOT a Git SHA — see the header note. This is the
-  # POST-PARTIAL-APPLY RECOVERY contract (9/4/0/0); the superseded pre-apply
-  # contract was 3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d.
-  P6_REVIEWED_HASH: 788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee
+  # SECOND-PARTIAL-APPLY RECOVERY contract (5/5/0/0); the superseded contracts
+  # were 788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee (first
+  # recovery, 9/4/0/0) and
+  # 3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d (pre-apply,
+  # 9/5/0/0).
+  P6_REVIEWED_HASH: 8e0e942484af7a868fd09703cebf7aef941d797c7a177e4d01e6620b3b94cd9d
 
 jobs:
   plan:
@@ -159,20 +168,28 @@ jobs:
           echo "Release payload HEAD: $rel (release_sha)"
           echo "Control-plane   HEAD: $ctl (workflow host ${{ github.ref }})"
 
-      - name: Prove the CONTROL policy is the 9/4 recovery contract (not a stale release policy)
+      - name: Prove the CONTROL policy is the 5/5 second-recovery contract (not a stale release policy)
         run: |
           set -euo pipefail
           test -f "$P6_POLICY" || { echo "::error::control policy $P6_POLICY not found"; exit 1; }
-          grep -q 'EXPECTED_ADD = 9' "$P6_POLICY" \
-            || { echo "::error::control policy EXPECTED_ADD != 9"; exit 1; }
-          grep -q 'EXPECTED_CHANGE = 4' "$P6_POLICY" \
-            || { echo "::error::control policy EXPECTED_CHANGE != 4 (stale 9/5 pre-apply policy?)"; exit 1; }
+          grep -q 'EXPECTED_ADD = 5' "$P6_POLICY" \
+            || { echo "::error::control policy EXPECTED_ADD != 5 (stale 9/4 or 9/5 policy?)"; exit 1; }
+          grep -q 'EXPECTED_CHANGE = 5' "$P6_POLICY" \
+            || { echo "::error::control policy EXPECTED_CHANGE != 5 (stale 9/4 or 9/5 policy?)"; exit 1; }
           grep -q "$P6_REVIEWED_HASH" "$P6_POLICY" \
-            || { echo "::error::control policy missing recovery hash $P6_REVIEWED_HASH"; exit 1; }
-          if grep -qE '"azurerm_container_app_environment\.staging"[[:space:]]*:' "$P6_POLICY"; then
-            echo "::error::control policy still lists azurerm_container_app_environment.staging in the allowlist"; exit 1
-          fi
-          echo "Control policy OK: Add=9 Change=4, recovery hash present, CAE update absent from allowlist"
+            || { echo "::error::control policy missing second-recovery hash $P6_REVIEWED_HASH"; exit 1; }
+          # These resources converged during the partial applies and must NOT be
+          # allowlisted (a create for any of them would be a policy violation).
+          for converged in \
+            '"azurerm_container_app_environment\.staging"[[:space:]]*:' \
+            '"azurerm_application_insights\.staging"[[:space:]]*:' \
+            '"azurerm_monitor_metric_alert\.servicebus_dead_letter"[[:space:]]*:' \
+            '"azurerm_monitor_metric_alert\.servicebus_queue_backlog"[[:space:]]*:'; do
+            if grep -qE "$converged" "$P6_POLICY"; then
+              echo "::error::control policy still lists an already-converged resource: $converged"; exit 1
+            fi
+          done
+          echo "Control policy OK: Add=5 Change=5, second-recovery hash present, converged resources absent from allowlist"
 
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
@@ -220,7 +237,7 @@ jobs:
             -var "deploy_workloads=true" \
             -var "image_tag=${{ inputs.release_sha }}"
 
-      - name: P6-specific plan policy (from CONTROL PLANE — recovery allowlist, 9/4/0/0, recovery hash)
+      - name: P6-specific plan policy (from CONTROL PLANE — recovery allowlist, 5/5/0/0, recovery hash)
         id: policy
         run: |
           set -euo pipefail
@@ -269,20 +286,28 @@ jobs:
           echo "Release payload HEAD: $rel (release_sha)"
           echo "Control-plane   HEAD: $ctl (workflow host ${{ github.ref }})"
 
-      - name: Prove the CONTROL policy is the 9/4 recovery contract (not a stale release policy)
+      - name: Prove the CONTROL policy is the 5/5 second-recovery contract (not a stale release policy)
         run: |
           set -euo pipefail
           test -f "$P6_POLICY" || { echo "::error::control policy $P6_POLICY not found"; exit 1; }
-          grep -q 'EXPECTED_ADD = 9' "$P6_POLICY" \
-            || { echo "::error::control policy EXPECTED_ADD != 9"; exit 1; }
-          grep -q 'EXPECTED_CHANGE = 4' "$P6_POLICY" \
-            || { echo "::error::control policy EXPECTED_CHANGE != 4 (stale 9/5 pre-apply policy?)"; exit 1; }
+          grep -q 'EXPECTED_ADD = 5' "$P6_POLICY" \
+            || { echo "::error::control policy EXPECTED_ADD != 5 (stale 9/4 or 9/5 policy?)"; exit 1; }
+          grep -q 'EXPECTED_CHANGE = 5' "$P6_POLICY" \
+            || { echo "::error::control policy EXPECTED_CHANGE != 5 (stale 9/4 or 9/5 policy?)"; exit 1; }
           grep -q "$P6_REVIEWED_HASH" "$P6_POLICY" \
-            || { echo "::error::control policy missing recovery hash $P6_REVIEWED_HASH"; exit 1; }
-          if grep -qE '"azurerm_container_app_environment\.staging"[[:space:]]*:' "$P6_POLICY"; then
-            echo "::error::control policy still lists azurerm_container_app_environment.staging in the allowlist"; exit 1
-          fi
-          echo "Control policy OK: Add=9 Change=4, recovery hash present, CAE update absent from allowlist"
+            || { echo "::error::control policy missing second-recovery hash $P6_REVIEWED_HASH"; exit 1; }
+          # These resources converged during the partial applies and must NOT be
+          # allowlisted (a create for any of them would be a policy violation).
+          for converged in \
+            '"azurerm_container_app_environment\.staging"[[:space:]]*:' \
+            '"azurerm_application_insights\.staging"[[:space:]]*:' \
+            '"azurerm_monitor_metric_alert\.servicebus_dead_letter"[[:space:]]*:' \
+            '"azurerm_monitor_metric_alert\.servicebus_queue_backlog"[[:space:]]*:'; do
+            if grep -qE "$converged" "$P6_POLICY"; then
+              echo "::error::control policy still lists an already-converged resource: $converged"; exit 1
+            fi
+          done
+          echo "Control policy OK: Add=5 Change=5, second-recovery hash present, converged resources absent from allowlist"
 
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:

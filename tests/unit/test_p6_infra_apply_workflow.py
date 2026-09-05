@@ -3,21 +3,29 @@
 These tests pin the CONTROL-PLANE / RELEASE-PAYLOAD checkout separation that
 recovers from the failure of run 33959502997. That run used a single checkout
 at ``release_sha`` and then executed ``p6_plan_policy.py`` FROM THAT RELEASE
-CHECKOUT, where the superseded pre-apply policy (9/5, hash 3f3de0cf, CAE update
-required) still lives — so the release payload shadowed the control-plane
-policy and rejected the correct live 9/4 recovery plan.
+CHECKOUT, where a superseded policy still lives — so the release payload
+shadowed the control-plane policy and rejected the correct live recovery plan.
 
 The fix keeps two pinned checkouts:
 
   * ``control-plane/`` at the workflow host commit (``github.sha`` on main) —
-    the source of the 9/4 recovery ``p6_plan_policy.py``;
+    the source of the CURRENT recovery ``p6_plan_policy.py``;
   * ``release/`` at exactly ``release_sha`` — the source of the Terraform root
     and the application/deploy scripts.
 
 Terraform must run from ``release/`` and the policy must run from
-``control-plane/`` in BOTH the plan job and the apply job's re-plan. These are
-text-level assertions on the workflow YAML so they run with no third-party
-dependency (the CI unit image has no PyYAML). Remove alongside
+``control-plane/`` in BOTH the plan job and the apply job's re-plan.
+
+Contract
+--------
+The CURRENT authoritative contract is the SECOND partial-apply recovery:
+5 add / 5 change / 0 destroy / 0 replace, hash 8e0e9424...  The two superseded
+contracts (first recovery 9/4 hash 788aaab8...; original pre-apply 9/5 hash
+3f3de0cf...) may appear only as documented history, never as the active
+require-hash target.
+
+These are text-level assertions on the workflow YAML so they run with no
+third-party dependency (the CI unit image has no PyYAML). Remove alongside
 ``.github/workflows/p6-infra-apply.yml`` after P6 staging validation.
 """
 
@@ -29,8 +37,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "p6-infra-apply.yml"
 
 RELEASE_SHA = "dd5151b27b7121e555b1f26eb455c2dd36f28495"  # documented, not enforced as input
-RECOVERY_HASH = "788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee"
-SUPERSEDED_HASH = "3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d"
+# CURRENT authoritative contract.
+RECOVERY_HASH = "8e0e942484af7a868fd09703cebf7aef941d797c7a177e4d01e6620b3b94cd9d"
+# Historical only — never the active require-hash target.
+FIRST_RECOVERY_HASH = "788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee"
+ORIGINAL_PRE_APPLY_HASH = "3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d"
 
 
 def _text() -> str:
@@ -63,8 +74,8 @@ def test_env_points_terraform_at_release_and_policy_at_control_plane() -> None:
     assert "P6_POLICY: control-plane/infra/terraform/scripts/p6_plan_policy.py" in text
     # (7) Smoke script resolves under the RELEASE checkout.
     assert "SMOKE_SCRIPT: release/scripts/ci/smoke-staging.sh" in text
-    # The recovery contract hash is pinned; the superseded hash only appears as
-    # documented history, never as the active require-hash target.
+    # The current recovery contract hash is pinned; the superseded hashes appear
+    # only as documented history, never as the active require-hash target.
     assert f"P6_REVIEWED_HASH: {RECOVERY_HASH}" in text
 
 
@@ -114,15 +125,24 @@ def test_terraform_never_runs_from_control_plane() -> None:
 
 
 def test_control_policy_provenance_guard_present_in_both_jobs() -> None:
-    # Runtime guard proving the control policy is the 9/4 recovery contract and
-    # that the CAE update is absent from its allowlist — in BOTH jobs.
+    # Runtime guard proving the control policy is the 5/5 second-recovery
+    # contract and that the already-converged resources are absent from its
+    # allowlist — in BOTH jobs.
     text = _text()
-    assert text.count("EXPECTED_CHANGE = 4") == 2
+    assert text.count("EXPECTED_ADD = 5") == 2
+    assert text.count("EXPECTED_CHANGE = 5") == 2
+    # The Container Apps Environment update must not be allowlisted (converged in
+    # the first partial apply).
     assert text.count('"azurerm_container_app_environment\\.staging"[[:space:]]*:') == 2
+    # Application Insights + the two Service Bus alerts converged in the second
+    # partial apply; their creates must not be allowlisted either.
+    assert text.count('"azurerm_application_insights\\.staging"[[:space:]]*:') == 2
+    assert text.count('"azurerm_monitor_metric_alert\\.servicebus_dead_letter"[[:space:]]*:') == 2
+    assert text.count('"azurerm_monitor_metric_alert\\.servicebus_queue_backlog"[[:space:]]*:') == 2
     for job_key in ("plan", "apply"):
         body = _job_slice(text, job_key)
-        assert "EXPECTED_ADD = 9" in body, f"{job_key}: missing control-policy Add=9 guard"
-        assert "EXPECTED_CHANGE = 4" in body, f"{job_key}: missing control-policy Change=4 guard"
+        assert "EXPECTED_ADD = 5" in body, f"{job_key}: missing control-policy Add=5 guard"
+        assert "EXPECTED_CHANGE = 5" in body, f"{job_key}: missing control-policy Change=5 guard"
         # The guard checks the recovery hash via the pinned env var (the literal
         # hash lives once in the env block, asserted separately).
         assert 'grep -q "$P6_REVIEWED_HASH"' in body, \
@@ -154,9 +174,10 @@ def test_run_apply_gating_and_mandatory_staging_environment() -> None:
     assert "environment: staging-plan" in plan
 
 
-def test_superseded_hash_is_never_the_active_contract() -> None:
-    # The old 9/5 hash may appear only in explanatory comments, never as the
-    # P6_REVIEWED_HASH value or a --require-hash argument.
+def test_superseded_hashes_are_never_the_active_contract() -> None:
+    # The old 9/4 and 9/5 hashes may appear only in explanatory comments, never
+    # as the P6_REVIEWED_HASH value or a --require-hash argument.
     text = _text()
-    assert f"P6_REVIEWED_HASH: {SUPERSEDED_HASH}" not in text
-    assert f"--require-hash {SUPERSEDED_HASH}" not in text
+    for old in (FIRST_RECOVERY_HASH, ORIGINAL_PRE_APPLY_HASH):
+        assert f"P6_REVIEWED_HASH: {old}" not in text
+        assert f"--require-hash {old}" not in text
