@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TEMPORARY, P6-SPECIFIC Terraform plan safety policy (POST-PARTIAL-APPLY RECOVERY).
+"""TEMPORARY, P6-SPECIFIC Terraform plan safety policy (SECOND-PARTIAL-APPLY RECOVERY).
 
 REMOVE AFTER P6 STAGING VALIDATION.
 
@@ -7,20 +7,38 @@ The steady-state deploy uses `plan_policy.py`, which deliberately rejects any
 foundation change and so (correctly) refuses the P6 observability rollout. P6
 intentionally adds Application Insights, a diagnostic setting, five metric
 alerts, two narrow role assignments, and reconfigures the four workloads. This
-one-time policy authorizes EXACTLY that plan and nothing else, so a
-tightly-reviewed infrastructure apply can proceed once without weakening the
+one-time policy authorizes EXACTLY the remaining live plan and nothing else, so
+a tightly-reviewed infrastructure apply can proceed once without weakening the
 generic policy.
 
-RECOVERY CONTRACT
------------------
-The ORIGINAL reviewed pre-apply plan was Add=9, Change=5 (hash 3f3de0cf...): it
-also reconfigured the Container Apps Environment. That apply partially succeeded
-— it converged the environment's logging destination (azure-monitor) before the
-Application-Insights-backed resources failed. The environment is therefore
-already converged, so its in-place update is intentionally REMOVED from this
-policy. The authoritative remaining plan is Add=9, Change=4 (hash 788aaab8...):
-the original plan minus exactly the `azurerm_container_app_environment.staging`
-update. If that update reappears, this policy MUST refuse it.
+RECOVERY CONTRACT HISTORY
+-------------------------
+Each contract below was CORRECT for the live Azure state when it was reviewed;
+successive partial applies converged more resources, shrinking the remaining
+plan. They are NOT corrections of one another.
+
+  1. ORIGINAL pre-apply plan: Add=9, Change=5 (hash 3f3de0cf...). Also
+     reconfigured the Container Apps Environment logging destination.
+  2. FIRST partial-apply recovery: Add=9, Change=4 (hash 788aaab8...). The first
+     apply converged the Container Apps Environment logging destination
+     (azure-monitor) before the Application-Insights-backed resources failed, so
+     the environment update dropped out.
+  3. SECOND partial-apply recovery (THIS CONTRACT / AUTHORITATIVE): Add=5,
+     Change=5 (hash 8e0e9424...). The second apply created Application Insights,
+     the diagnostic setting, and the two Service Bus alerts before failing on
+     the Application-Insights role assignments (an RBAC write). Those four
+     creates have therefore converged and are intentionally REMOVED from this
+     policy; the diagnostic setting now shows as an in-place UPDATE (Terraform
+     normalizes `log_analytics_destination_type = "Dedicated"`). What remains is
+     exactly the three job/server-error metric alerts + two role assignments to
+     create, and the four workloads + the diagnostic setting to update.
+
+The following are already converged and MUST NOT reappear as create/update
+actions (a create for any of them is a policy violation):
+`azurerm_application_insights.staging`,
+`azurerm_monitor_metric_alert.servicebus_dead_letter`,
+`azurerm_monitor_metric_alert.servicebus_queue_backlog`, and
+`azurerm_container_app_environment.staging`.
 
 Reads `terraform show -json <plan>` (file arg or stdin) and enforces:
 
@@ -30,7 +48,7 @@ Reads `terraform show -json <plan>` (file arg or stdin) and enforces:
      and its action must match the reviewed action (create vs update) exactly.
   3. Every allowlisted resource must appear exactly once (no missing, no
      duplicate index).
-  4. The totals must be exactly Add=9, Change=4, Destroy=0, Replace=0.
+  4. The totals must be exactly Add=5, Change=5, Destroy=0, Replace=0.
   5. The deterministic sanitized-plan hash must equal the reviewed recovery hash
      (unless the gate is explicitly relaxed for testing).
 
@@ -49,36 +67,40 @@ import sys
 # Exact P6 recovery allowlist: bare `type.name` (module prefix and
 # count/for_each index stripped) -> the single reviewed action for that
 # resource. Nothing outside this set may change, and no resource here may take a
-# different action. The Container Apps Environment update is intentionally ABSENT
-# (already converged by the partial apply) and must not reappear.
+# different action. Application Insights, the two Service Bus alerts, and the
+# Container Apps Environment update are intentionally ABSENT (already converged
+# by the partial applies) and must not reappear. The diagnostic setting has been
+# created and now appears here as an in-place UPDATE, not a create.
 P6_ALLOWLIST: dict[str, str] = {
-    # 9 creates
-    "azurerm_application_insights.staging": "create",
-    "azurerm_monitor_diagnostic_setting.container_app_environment": "create",
+    # 5 creates
     "azurerm_monitor_metric_alert.api_server_errors": "create",
     "azurerm_monitor_metric_alert.migration_job_failure": "create",
-    "azurerm_monitor_metric_alert.servicebus_dead_letter": "create",
-    "azurerm_monitor_metric_alert.servicebus_queue_backlog": "create",
     "azurerm_monitor_metric_alert.worker_job_failure": "create",
     "azurerm_role_assignment.application_insights_api": "create",
     "azurerm_role_assignment.application_insights_worker": "create",
-    # 4 updates (the Container Apps Environment update has already converged)
+    # 5 updates (Application Insights + the diagnostic setting were created by
+    # the second partial apply; the diagnostic setting now normalizes
+    # log_analytics_destination_type = "Dedicated" as an in-place update)
     "azurerm_container_app.api": "update",
     "azurerm_container_app.frontend": "update",
     "azurerm_container_app_job.migration": "update",
     "azurerm_container_app_job.worker": "update",
+    "azurerm_monitor_diagnostic_setting.container_app_environment": "update",
 }
 
-EXPECTED_ADD = 9
-EXPECTED_CHANGE = 4
+EXPECTED_ADD = 5
+EXPECTED_CHANGE = 5
 EXPECTED_DESTROY = 0
 EXPECTED_REPLACE = 0
 
 # SHA-256 over the canonical sanitized (address+actions) representation of the
-# POST-PARTIAL-APPLY RECOVERY plan (the original reviewed plan minus the
-# already-converged azurerm_container_app_environment.staging update). The
-# superseded pre-apply hash was 3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d.
-REVIEWED_SHA256 = "788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee"
+# SECOND-PARTIAL-APPLY RECOVERY plan (the first-recovery plan minus the
+# already-converged Application Insights + two Service Bus alert creates, with
+# the diagnostic setting moved from create to update). The superseded hashes
+# were 788aaab8c160b14daa12384b6f75159c42e471f1e3adad750b17de3aa48451ee
+# (first recovery) and
+# 3f3de0cf0a15fd7f8f457c659a1a6bba8879274a6c34f802b7ab261ca325c49d (pre-apply).
+REVIEWED_SHA256 = "8e0e942484af7a868fd09703cebf7aef941d797c7a177e4d01e6620b3b94cd9d"
 
 # Actions Terraform may report; "no-op"/"read" never count as changes.
 NOOP_ACTIONS = ({"no-op"}, {"read"})
@@ -244,7 +266,7 @@ def main(argv: list[str]) -> int:
             print(f"  - {v}", file=sys.stderr)
         return 2
 
-    print("p6-plan-policy: PASS (exact P6 recovery allowlist, 9/4/0/0, recovery hash matched)")
+    print("p6-plan-policy: PASS (exact P6 recovery allowlist, 5/5/0/0, recovery hash matched)")
     return 0
 
 
