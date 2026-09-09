@@ -10,33 +10,33 @@ requires-python = ">=3.11"
 
 [project.optional-dependencies]
 test = [
-  "fastapi==0.140.0",
-  "httpx2==2.9.1",
-  "jsonschema==4.25.1",
+  "fastapi==0.141.1",
+  "httpx2==2.12.0",
+  "jsonschema==4.26.0",
   "pytest==8.4.1",
-  "python-multipart==0.0.22",
+  "python-multipart==0.0.32",
   # P2 cloud-adapter test dependencies (integration tests skip without emulators).
   "SQLAlchemy==2.0.52",
-  "psycopg==3.3.4",
-  "alembic==1.19.1",
-  "azure-storage-blob==12.30.0",
+  "psycopg==3.3.5",
+  "alembic==1.19.2",
+  "azure-storage-blob==12.30.1",
   "azure-servicebus==7.14.3",
   "azure-identity==1.25.3",
 ]
 api = [
-  "fastapi==0.140.0",
-  "uvicorn==0.51.0",
-  "python-multipart==0.0.22",
+  "fastapi==0.141.1",
+  "uvicorn==0.52.4",
+  "python-multipart==0.0.32",
 ]
 # P2 control plane (PostgreSQL). See requirements-postgres.txt for the pinned lock.
 postgres = [
   "SQLAlchemy==2.0.52",
-  "psycopg==3.3.4",
-  "alembic==1.19.1",
+  "psycopg==3.3.5",
+  "alembic==1.19.2",
 ]
 # P2 cloud data plane + queue (Azure). See requirements-azure.txt for the lock.
 cloud = [
-  "azure-storage-blob==12.30.0",
+  "azure-storage-blob==12.30.1",
   "azure-servicebus==7.14.3",
   "azure-identity==1.25.3",
 ]

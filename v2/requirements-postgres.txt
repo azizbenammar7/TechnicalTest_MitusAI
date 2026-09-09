@@ -5,8 +5,8 @@
 # musllinux wheels. Requires a C toolchain + libpq headers at build time and the
 # libpq runtime library in the final image.
 SQLAlchemy==2.0.52
-psycopg==3.3.4
-psycopg-c==3.3.4
-alembic==1.19.1
+psycopg==3.3.5
+psycopg-c==3.3.5
+alembic==1.19.2
 Mako==1.4.1
 MarkupSafe==3.0.3
