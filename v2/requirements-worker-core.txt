@@ -1,11 +1,11 @@
 # Complete non-v1 worker core lock for Python 3.13 Linux images.
-numpy==2.2.6
+numpy==2.4.6
 pandas==2.2.3
-scipy==1.15.3
+scipy==1.17.1
 typing_extensions==4.16.0
-packaging==26.2
+packaging==26.3
 certifi==2026.7.22
-idna==3.18
+idna==3.19
 python-dateutil==2.9.0.post0
 pytz==2026.3.post1
 six==1.17.0
